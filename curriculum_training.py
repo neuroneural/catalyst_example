@@ -63,7 +63,7 @@ COLLECTION = "MRNslabs"
 INDEX_ID = "subject"
 VIEWFIELDS = ["subdata", LABELNOW, "id", "subject"]
 config_file = "modelAE.json"
-
+WANDBTEAM = "torch2" # edit this to your team name at wandb.ai
 # COLLECTION = "HCP"
 
 
@@ -135,6 +135,7 @@ class CustomRunner(dl.Runner):
             "wandb": dl.WandbLogger(
                 project=self.wandb_project,
                 name=self.wandb_experiment,
+                entity=WANDBTEAM,
                 log_batch_metrics=True,
             ),
         }
