@@ -20,6 +20,7 @@ pip3 install scipy
 2. Use the code in this repository to train your model
    1. The main file is `curriculum_training.py`
    2. Edit everything.
-   3. Mainly make sure that `get_model` method of the `CustomRunner`
+   3. Do not forget to set WANDBTEAM to the value of your team, so your logs are in the correct place
+   4. Mainly make sure that `get_model` method of the `CustomRunner`
       class initializes your model
 
