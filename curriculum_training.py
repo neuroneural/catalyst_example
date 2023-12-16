@@ -29,7 +29,7 @@ from torch.optim.lr_scheduler import (
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from dice import faster_dice, DiceLoss
-from meshnet import enMesh_checkpoint
+from meshnet import enMesh_checkpoint, enMesh
 from mongoslabs.gencoords import CoordsGenerator
 
 from mongoslabs.mongoloader import (
