@@ -235,6 +235,189 @@ class enMesh_checkpoint(MeshNet):
         else:
             return self.eval_forward(x)
 
+class enMesh(MeshNet):
+    def __init__(
+        self,
+        in_channels,
+        n_classes,
+        channels,
+        config_file,
+        optimize_inline=False,
+    ):
+        super(enMesh, self).__init__(
+            in_channels, n_classes, channels, config_file
+        )
+        self.n_classes = n_classes
+        self.optimize_inline = optimize_inline
+        if self.optimize_inline:
+            self.optimizers = [
+                torch.optim.Adam(net.parameters(), lr=0.02)
+                for net in self.model
+            ]
+
+    def get_grads(self, grads):
+        def show(self, grad_input, grad_output):
+            grads["in"] = grad_input
+            grads["out"] = grad_output
+
+        return show
+
+    def set_requires_grad_layer(self, layer, flag, trainBN=True):
+        layer.train(flag)
+        for x in layer.parameters():
+            if not flag:
+                del x.grad
+                x.detach()
+            x.grad = [None, x.grad][flag]
+            x.requires_grad = flag
+        if (
+            trainBN
+            and isinstance(layer, torch.nn.Sequential)
+            and isinstance(layer[1], torch.nn.BatchNorm3d)
+        ):
+            layer[1].training = True
+            layer[1].requires_grad = True
+
+    def unset_grad(self, layer):
+        self.set_requires_grad_layer(layer, False)
+
+    def set_grad(self, layer):
+        self.set_requires_grad_layer(layer, True)
+
+    def dump_tensors(gpu_only=True):
+        # torch.cuda.empty_cache()
+        total_size = 0
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj):
+                    if not gpu_only or obj.is_cuda:
+                        del obj
+                        gc.collect()
+                elif hasattr(obj, "data") and torch.is_tensor(obj.data):
+                    if not gpu_only or obj.is_cuda:
+                        del obj
+                        gc.collect()
+            except Exception as e:
+                pass
+
+    def eval_forward(self, x):
+        """Forward pass"""
+        with torch.inference_mode():
+            for i, layer in enumerate(self.model):
+                x = layer(x)
+        return x
+
+    def forward(self, x, y=None, loss=None, verbose=False):
+        if self.training:
+            return self.backforward(x, y, loss, verbose=verbose)
+        else:
+            return self.eval_forward(x)
+
+    def backforward(self, x, y, loss, verbose=False):
+        if verbose:
+            h = nvmlDeviceGetHandleByIndex(0)
+            info = nvmlDeviceGetMemoryInfo(h)
+            print(f"total    : {info.total}")
+            print(f"free     : {info.free}")
+            print(f"used     : {info.used}")
+            print(f"used fr  : {info.used/info.total}")
+
+        gradients = {}
+        layers = [p for p in self.model]
+        for p in layers:
+            self.unset_grad(p)
+
+        grads = {}
+        handle = layers[-1].register_full_backward_hook(self.get_grads(grads))
+
+        self.set_grad(layers[-1])
+        input = x
+        input.requires_grad = False
+        for count, layer in enumerate(layers):
+            input = layer(input)
+        y_hat = input
+        input.requires_grad_()
+        input.detach()
+
+        if verbose:
+            info = nvmlDeviceGetMemoryInfo(h)
+            print(f"used fr  : {info.used/info.total}")
+
+        if isinstance(loss, torch.nn.CrossEntropyLoss):
+            output = loss(input, y)
+        else:
+            one_hot_targets = torch.nn.functional.one_hot(
+                y, self.n_classes
+            ).permute(0, 4, 1, 2, 3)
+            logits_softmax = F.softmax(input, dim=1)
+            output = loss(logits_softmax, one_hot_targets)
+        output.backward()
+        output.detach()
+        lss_value = output
+        del output
+        del input
+        self.unset_grad(layers[-1])
+        handle.remove()
+
+        dloss_dx2 = grads["out"][0]
+
+        del grads["in"]
+
+        if verbose:
+            info = nvmlDeviceGetMemoryInfo(h)
+            print(f"used fr  : {info.used/info.total}")
+            print("*" * 20)
+
+        # unembedded = True
+        for i in range(len(layers) - 1, -1, -1):
+            input = x.detach().clone()
+            input.requires_grad = False
+            grads = {}
+            handle = layers[i].register_full_backward_hook(
+                self.get_grads(grads)
+            )
+            self.set_grad(layers[i])
+
+            # Recompute the forward pass up to the current layer
+            for j in range(0, i + 1):
+                if j == i:
+                    input.detach()
+                    input.requires_grad_()
+                input = layers[j](input)
+
+            input.detach()
+            torch.autograd.backward(input, dloss_dx2)
+
+            del dloss_dx2
+            dloss_dx2 = grads["in"][0]
+
+            if self.optimize_inline:
+                self.optimizers[i].step()
+                self.optimizers[i].zero_grad(set_to_none=True)
+            else:
+                gradients[i] = [x.grad for x in layers[i].parameters()]
+
+            self.unset_grad(layers[i])
+            handle.remove()
+            del input.grad
+            del x.grad
+            del input
+            x.requires_grad = False
+        del dloss_dx2
+        self.model.eval()
+        if not self.optimize_inline:
+            for i in range(len(layers)):
+                # self.set_grad(layers[i])
+                for p, g in zip(layers[i].parameters(), gradients[i]):
+                    p.grad = g
+        del layers
+        if verbose:
+            info = nvmlDeviceGetMemoryInfo(h)
+            print(f"{i} used fr  : {info.used/info.total}")
+        # torch.cuda.empty_cache()
+        # self.dump_tensors()
+
+        return lss_value, y_hat
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
