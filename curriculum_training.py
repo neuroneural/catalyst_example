@@ -433,7 +433,7 @@ if __name__ == "__main__":
     model_channels = 15
     model_label = "_startLARGE"
 
-    model_path = f"./logs/tmp/curriculum_enmesh_{model_channels}channels_3_do/model.last.pth"
+    model_path = f""
     logdir = f"./logs/tmp/curriculum_enmesh_{model_channels}channels_3_nodo/"
     wandb_project = f"curriculum_{model_channels}_gwm"
 
