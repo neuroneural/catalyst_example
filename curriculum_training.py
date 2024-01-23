@@ -52,7 +52,7 @@ os.environ["NCCL_SOCKET_IFNAME"] = "ib0"
 # os.environ["NCCL_P2P_LEVEL"] = "NVL"
 
 volume_shape = [256] * 3
-MAXSHAPE = 300
+MAXSHAPE = 192
 
 LABELNOW = ["sublabel", "gwmlabel", "50label"][1]
 n_classes = [104, 3, 50][1]
