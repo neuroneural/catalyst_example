@@ -440,8 +440,8 @@ if __name__ == "__main__":
     client_creator = ClientCreator(DBNAME, MONGOHOST, LABELNOW)
 
     # set up parameters of your experiment
-    cubesizes = [256] * 6
-    batchsize = [1] * 6
+    cubesizes = [32, 32, 64, 64, 192, 256]
+    batchsize = [32, 32, 16, 16, 1, 1]
     weights = [0.5] * 2 + [1] * 4  # weights for the 0-class
     collections = ["HCP", "MRNslabs"] * 3
     epochs = [50] * 2 + [100] * 2 + [50, 10]
