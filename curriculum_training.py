@@ -30,13 +30,18 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from dice import faster_dice, DiceLoss
 from meshnet import enMesh_checkpoint, enMesh
-from mongoslabs.gencoords import CoordsGenerator
 
-from mongoslabs.mongoloader import (
+from mindfultensors.gencoords import CoordsGenerator
+from mindfultensors.utils import (
+    unit_interval_normalize,
+    qnormalize,
+    DBBatchSampler,
+)
+
+from mindfultensors.mongoloader import (
     create_client,
     collate_subcubes,
     mcollate,
-    MBatchSampler,
     MongoDataset,
     MongoClient,
     mtransform,
@@ -187,9 +192,9 @@ class CustomRunner(dl.Runner):
         )
 
         tsampler = (
-            DistributedSamplerWrapper(MBatchSampler(tdataset, batch_size=1))
+            DistributedSamplerWrapper(DBBatchSampler(tdataset, batch_size=1))
             if self.engine.is_ddp
-            else MBatchSampler(tdataset, batch_size=1)
+            else DBBatchSampler(tdataset, batch_size=1)
         )
 
         tdataloader = BatchPrefetchLoaderWrapper(
@@ -217,9 +222,9 @@ class CustomRunner(dl.Runner):
             fields=VIEWFIELDS,
         )
         vsampler = (
-            DistributedSamplerWrapper(MBatchSampler(vdataset, batch_size=1))
+            DistributedSamplerWrapper(DBBatchSampler(vdataset, batch_size=1))
             if self.engine.is_ddp
-            else MBatchSampler(vdataset, batch_size=1)
+            else DBBatchSampler(vdataset, batch_size=1)
         )
         vdataloader = BatchPrefetchLoaderWrapper(
             DataLoader(
