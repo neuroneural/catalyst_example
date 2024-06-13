@@ -192,7 +192,13 @@ class CustomRunner(dl.Runner):
         )
 
         tsampler = (
-            DistributedSamplerWrapper(DBBatchSampler(tdataset, batch_size=1))
+            DistributedSamplerWrapper(DBBatchSampler(
+                tdataset,
+                batch_size=1
+                num_replicas=1,
+                rank=0,   #    one of these lines 
+                seed=0,   #    is the fix
+            ))
             if self.engine.is_ddp
             else DBBatchSampler(tdataset, batch_size=1)
         )
