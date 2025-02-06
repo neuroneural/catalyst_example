@@ -8,9 +8,10 @@ an example of the training file supporting distributed training and curriculum l
 MYNEWENV="" # write a name of your environment in quotes, like "torch"
 conda create --name ${MYNEWENV} python=3.9
 conda activate ${MYNEWENV}
+pip3 install torch torchvision torchaudio
 pip3 install -U catalyst
 conda install -c anaconda nccl
-pip install  mongoslabs
+pip install  mindfultensors
 pip3 install pymongo
 pip3 install nibabel
 pip3 install pynvml
