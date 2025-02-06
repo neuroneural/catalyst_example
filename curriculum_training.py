@@ -30,13 +30,17 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from dice import faster_dice, DiceLoss
 from meshnet import enMesh_checkpoint, enMesh
-from mongoslabs.gencoords import CoordsGenerator
+from mindfultensors.gencoords import CoordsGenerator
+from mindfultensors.utils import (
+    unit_interval_normalize,
+    qnormalize,
+    DBBatchSampler,
+)
 
-from mongoslabs.mongoloader import (
+from mindfultensors.mongoloader import (
     create_client,
     collate_subcubes,
     mcollate,
-    MBatchSampler,
     MongoDataset,
     MongoClient,
     mtransform,
