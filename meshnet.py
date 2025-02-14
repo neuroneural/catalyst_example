@@ -132,6 +132,16 @@ class enMesh_checkpoint(MeshNet):
             return self.eval_forward(x)
 
 
+class enMesh_fixedpoint(enMesh_checkpoint):
+    def train_forward(self, x):
+        x.requires_grad_()
+        for i in range(self.max_iter):
+            y = checkpoint_sequential(
+                self.model, len(self.model), y, preserve_rng_state=False
+            )
+            # need to prepend on the channel dimension a tensor x with self.channels as number of channels + N for the y channels
+            x = torch.cat([x, y], dim=1)
+        return y
 # The above is of course a classical trade of computation for memory.  However, pytorch still caches a lot and thus uses more memory than needed. Below is my manual implementation that is slower than above, but most memory economical
 #
 # Why am I giving this slower model to you :) If you want to train on GPUs with 40GB or 48GB (e.g. A40) then the model below is helpful. I suspect this is not meshnet specific and u-net is also positively affected by what I am going to describe, but here is how I train meshnets.  Given training data and model architecture (mostly number of channels).
