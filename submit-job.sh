@@ -18,8 +18,8 @@ sleep 10s
 
 echo $HOSTNAME >&2
 
-conda activate $MYNEWENV
+source ~/miniconda3/etc/profile.d/conda.sh
 
-python curriculum_training.py
+conda run -n $MYNEWENV python curriculum_training.py
 
 sleep 10s

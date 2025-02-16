@@ -32,8 +32,6 @@ sbatch run_training.sh
 
 
 # Gotchas to look out for:
-1. Failure to connect to mongoDB
-> Solution: change the MONGOHOST from "10.245.12.58" to "arctrdcn018.rs.gsu.edu" in `conf/vanilla_3class_gn_11chan32.16.1_exp01.yaml`
 
 1. Failure to connect to wandb
 > Solution: Ensure you have a wandb account, get a token and use it to login to wandb using `wandb login`. Also ensure that you change the WANDBTEAM and project from "hydra-meshnet" to "your-team-name" and "your-project-name" respectively in `conf/vanilla_3class_gn_11chan32.16.1_exp01.yaml`

@@ -1,6 +1,7 @@
 # an experiment with only 3 layers in meshnet 16,1,16
 mongo:
   host: "10.245.12.58" # "arctrdcn018.rs.gsu.edu"
+  host_slurm: "arctrdcn018.rs.gsu.edu"
   dbname: "MindfulTensors"
   collection: "MRN"
   index_id: "id"

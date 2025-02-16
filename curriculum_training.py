@@ -562,6 +562,7 @@ def main(cfg: DictConfig):
     use_groupnorm = cfg.model.use_groupnorm
     model_path = cfg.paths.model if cfg.paths.loadcheckpoint else ""
     logdir = cfg.paths.logdir
+    db_host = cfg.mongo.host_slurm if os.environ.get("SLURM_JOB_ID") else cfg.mongo.host
 
     # MongoDB parameters
     validation_percent = cfg.mongo.validation_percent
@@ -571,7 +572,7 @@ def main(cfg: DictConfig):
     bit16 = cfg.bit16
 
     client_creator = ClientCreator(
-        cfg.mongo.host, crop_tensor=cfg.client_creator.crop_tensor
+        db_host, crop_tensor=cfg.client_creator.crop_tensor
     )
 
     # Specify curriculum parameters
@@ -654,7 +655,7 @@ def main(cfg: DictConfig):
             lowprecision=bit16,
             lossweight=cfg.model.loss_weight,
             meshnetme=cfg.model.use_me,
-            db_host=cfg.mongo.host,
+            db_host=db_host,
             wandb_team=cfg.wandb.team,
             maxshape=cfg.model.maxshape,
         )
