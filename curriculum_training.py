@@ -40,18 +40,6 @@ os.environ["NCCL_SOCKET_IFNAME"] = "ib0"
 
 MAXSHAPE = 300
 
-LABELFIELD = "label104"
-DATAFIELD = "T1"
-
-
-MONGOHOST = "10.245.12.58"  # "arctrdcn018.rs.gsu.edu"
-DBNAME = "MindfulTensors"
-COLLECTION = "MRN"
-INDEX_ID = "id"
-config_file = "modelAE.json"
-WANDBTEAM = "hydra-meshnet"
-
-
 torch_version = torch.__version__
 if version.parse(torch_version) >= version.parse("2.3"):
     scaler = torch.amp.GradScaler()
@@ -134,17 +122,19 @@ class CustomRunner(dl.Runner):
         off_brain_weight: float,
         indexid: str,
         modelconfig: str,
+        db_host: str,
+        db_name: str,
+        db_collection: str,
+        wandb_team: str,
+        db_fields: tuple,
         groupnorm=False,
         prefetches=8,
         volume_shape=[256] * 3,
         subvolume_shape=[256] * 3,
-        db_host=MONGOHOST,
-        db_name=DBNAME,
-        db_collection=COLLECTION,
-        db_fields=(DATAFIELD, LABELFIELD),
         lowprecision=False,
         meshnetme=False,
         lossweight=[1, 0],
+        maxshape=300,
     ):
         super().__init__()
         self._logdir = logdir
@@ -171,10 +161,12 @@ class CustomRunner(dl.Runner):
         self.funcs = None
         self.collate = None
         self.bit16 = lowprecision
-        self.INDEX_ID = indexid
+        self.index_id = indexid
         self.groupnorm = groupnorm
         self.loss_weight = lossweight
         self.meshnetme = meshnetme
+        self.wandb_team = wandb_team
+        self.maxshape = maxshape
 
     def get_engine(self):
         if torch.cuda.device_count() > 1:
@@ -195,7 +187,7 @@ class CustomRunner(dl.Runner):
             "wandb": dl.WandbLogger(
                 project=self.wandb_project,
                 name=self.wandb_experiment,
-                entity=WANDBTEAM,
+                entity=self.wandb_team,
                 log_batch_metrics=True,
                 # log_epoch_metrics=True,
             ),
@@ -239,7 +231,7 @@ class CustomRunner(dl.Runner):
         db = client[self.db_name]
         posts = db[self.db_collection + ".bin"]
         num_examples = int(
-            posts.find_one(sort=[(self.INDEX_ID, -1)])[self.INDEX_ID] + 1
+            posts.find_one(sort=[(self.index_id, -1)])[self.index_id] + 1
         )
 
         tdataset = MongoheadDataset(
@@ -254,7 +246,7 @@ class CustomRunner(dl.Runner):
             None,
             self.db_fields,
             normalize=unit_interval_normalize,
-            id=self.INDEX_ID,
+            id=self.index_id,
         )
 
         tsampler = (
@@ -283,7 +275,7 @@ class CustomRunner(dl.Runner):
             None,
             self.db_fields,
             normalize=unit_interval_normalize,
-            id=self.INDEX_ID,
+            id=self.index_id,
         )
 
         vsampler = (
@@ -317,7 +309,7 @@ class CustomRunner(dl.Runner):
             modelClass = (
                 enMesh_checkpoint_gn if self.groupnorm else enMesh_checkpoint
             )
-        if self.shape > MAXSHAPE:
+        if self.shape > self.maxshape:
             model = enMesh(
                 in_channels=1,
                 n_classes=self.n_classes,
@@ -421,7 +413,7 @@ class CustomRunner(dl.Runner):
         # stop
         # run model forward/backward pass
         if self.model.training:
-            if self.shape > MAXSHAPE:
+            if self.shape > self.maxshape:
                 if self.engine.is_ddp:
                     with self.model.no_sync():
                         loss, y_hat = self.model.forward(
@@ -572,21 +564,14 @@ def main(cfg: DictConfig):
     logdir = cfg.paths.logdir
 
     # MongoDB parameters
-    MONGOHOST = cfg.mongo.host
-    DBNAME = cfg.mongo.dbname
-    COLLECTION = cfg.mongo.collection
-    INDEX_ID = cfg.mongo.index_id
-    LABELFIELD = cfg.mongo.labelfield
-    DATAFIELD = cfg.mongo.datafield
     validation_percent = cfg.mongo.validation_percent
 
-    WANDBTEAM = cfg.wandb.team
     wandb_project = cfg.wandb.project
 
     bit16 = cfg.bit16
 
     client_creator = ClientCreator(
-        MONGOHOST, crop_tensor=cfg.client_creator.crop_tensor
+        cfg.mongo.host, crop_tensor=cfg.client_creator.crop_tensor
     )
 
     # Specify curriculum parameters
@@ -619,36 +604,27 @@ def main(cfg: DictConfig):
 
     start_experiment = 0
     for experiment in range(len(cubesizes)):
-        COLLECTION = collections[experiment]
-        DBNAME = databases[experiment]
-        PAYLOADLABELS = dbfields[experiment]
-        num_subcubes = numcubes[experiment]
-        num_volumes = numvolumes[experiment]
-
-        off_brain_weight = weights[experiment]
         subvolume_shape = [cubesizes[experiment]] * 3
         onecycle_lr = rmsprop_lr = (
             attenuates[experiment] ** experiment
             * 8
             * cfg.experiment.lr_scale
-            * num_subcubes
-            * num_volumes
+            * numcubes[experiment]
+            * numvolumes[experiment]
             / 256
         )
-        n_epochs = epochs[experiment]
-        n_fetch = prefetches[experiment]
         wandb_experiment = (
             f"{start_experiment + experiment:02} cube "
             + str(subvolume_shape[0])
             + " "
-            + COLLECTION
+            + collections[experiment]
             + model_label
         )
 
         # Set database parameters
-        client_creator.set_database(DBNAME)
-        client_creator.set_collection(COLLECTION)
-        client_creator.set_num_subcubes(num_subcubes)
+        client_creator.set_database(databases[experiment])
+        client_creator.set_collection(collections[experiment])
+        client_creator.set_num_subcubes(numcubes[experiment])
         client_creator.set_shape(subvolume_shape)
 
         runner = CustomRunner(
@@ -659,25 +635,28 @@ def main(cfg: DictConfig):
             n_channels=model_channels,
             n_classes=n_classes,
             modelconfig=config_file,
-            n_epochs=n_epochs,
+            n_epochs=epochs[experiment],
             optimize_inline=optimize_inline,
             validation_percent=validation_percent,
             onecycle_lr=onecycle_lr,
             rmsprop_lr=rmsprop_lr,
-            num_subcubes=num_subcubes,
-            num_volumes=num_volumes,
+            num_subcubes=numcubes[experiment],
+            num_volumes=numvolumes[experiment],
             groupnorm=use_groupnorm,
             client_creator=client_creator,
-            off_brain_weight=off_brain_weight,
-            prefetches=n_fetch,
-            indexid=INDEX_ID,
-            db_collection=COLLECTION,
-            db_name=DBNAME,
-            db_fields=PAYLOADLABELS,
+            off_brain_weight=weights[experiment],
+            prefetches=prefetches[experiment],
+            indexid=cfg.mongo.index_id,
+            db_collection=collections[experiment],
+            db_name=databases[experiment],
+            db_fields=dbfields[experiment],
             subvolume_shape=subvolume_shape,
             lowprecision=bit16,
             lossweight=cfg.model.loss_weight,
             meshnetme=cfg.model.use_me,
+            db_host=cfg.mongo.host,
+            wandb_team=cfg.wandb.team,
+            maxshape=cfg.model.maxshape,
         )
         runner.run()
 
