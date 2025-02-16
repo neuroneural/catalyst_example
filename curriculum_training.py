@@ -37,9 +37,6 @@ os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 os.environ["NCCL_SOCKET_IFNAME"] = "ib0"
 # os.environ["NCCL_P2P_LEVEL"] = "NVL"
 
-
-MAXSHAPE = 300
-
 torch_version = torch.__version__
 if version.parse(torch_version) >= version.parse("2.3"):
     scaler = torch.amp.GradScaler()
