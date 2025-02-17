@@ -35,3 +35,7 @@ sbatch run_training.sh
 
 1. Failure to connect to wandb
 > Solution: Ensure you have a wandb account, get a token and use it to login to wandb using `wandb login`. Also ensure that you change the WANDBTEAM and project from "hydra-meshnet" to "your-team-name" and "your-project-name" respectively in `conf/vanilla_3class_gn_11chan32.16.1_exp01.yaml`
+
+2. The `mongo.host` address in `conf/vanilla_3class_gn_11chan32.16.1_exp01.yaml` connects on "10.245.12.58" when the code is run outside of Slurm context (on the dev node, for example) but connects on "arctrdcn018.rs.gsu.edu" if you are running the code on Slurm. To differentiate between the two cases, we use the `SLURM_JOB_ID` environment variable. If it is set, we are running on Slurm, otherwise we are running outside of Slurm.
+
+
