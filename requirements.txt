@@ -1,0 +1,9 @@
+torch
+torchvision
+torchaudio
+numpy
+nvidia-nccl-cu12
+pillow
+tqdm
+wandb
+tensorboardX

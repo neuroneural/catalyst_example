@@ -1,0 +1,60 @@
+# an experiment with only 3 layers in meshnet 16,1,16
+mongo:
+  host: "10.245.12.58" # "arctrdcn018.rs.gsu.edu"
+  host_slurm: "arctrdcn018.rs.gsu.edu"
+  dbname: "MindfulTensors"
+  collection: "MRN"
+  index_id: "id"
+  labelfield: "label3"
+  datafield: "T1"
+  validation_percent: 0.1
+
+wandb:
+  team: "hydra-meshnet"
+  project: "debug"
+
+bit16: False
+
+model:
+  n_classes: 3
+  model_channels: 11
+  model_label: "_11.32.16.1.gn"
+  config_file: "./modelAE.json"
+  volume_shape: [256, 256, 256]
+  maxshape: 300
+  optimize_inline: False
+  use_groupnorm: True
+  use_me: False
+  loss_weight: [0, 1]
+
+paths:
+  loadcheckpoint: False
+  model: "./logs/tmp/synth3_11chn_32.16.1.gn/model.last.pth"
+  logdir: "./logs/tmp/synth3_11chn_32.16.1.gn/"
+
+client_creator:
+  crop_tensor: False
+
+experiment:
+  lr_scale: 1
+  maxreps: 10
+  cubesizes_code: |
+    [256] * maxreps
+  numcubes_code: |
+    [1] * maxreps
+  numvolumes_code: |
+    [1] * maxreps
+  weights_code: |
+    [1] * maxreps
+  databases_code: |
+    ["MindfulTensors"] * maxreps
+  collections_code: |
+    ["HCPnew"] * maxreps
+  dbfields_code: |
+    [("T1", "label3")] * maxreps
+  epochs_code: |
+    [10] * (maxreps-2) + [50, 100]
+  prefetches_code: |
+    [24] * maxreps
+  attenuates_code: |
+    [0.8] * maxreps
