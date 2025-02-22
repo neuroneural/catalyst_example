@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 import hydra
 from omegaconf import DictConfig
 import os
@@ -28,6 +29,11 @@ from mindfultensors.mongoloader import (
     MongoheadDataset,
     mtransform,
 )
+
+parser = ArgumentParser()
+parser.add_argument("--config", type=str, default="vanilla_3class_gn_11chan32.16.1_exp01", help="config name without .yaml")
+parser.add_argument("--config_path", type=str, default="conf", help="config path")
+args = parser.parse_args()
 
 SEED = random.randint(0, 9999)
 utils.set_global_seed(SEED)
@@ -546,7 +552,7 @@ def assert_equal_length(*args):
 
 
 
-@hydra.main(config_path="conf", config_name="vanilla_3class_gn_11chan32.16.1_exp01", version_base=None)
+@hydra.main(config_path=args.config_path, config_name=args.config, version_base=None)
 def main(cfg: DictConfig):
     # Loading common parameters
     # Model parameters
