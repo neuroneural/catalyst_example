@@ -22,11 +22,11 @@ pip install -r requirements.txt
 1. Configure `submit-job.sh` by changing the following:
    ```bash
    # Required changes:
-   MYNEWENV=""        # Set to your conda environment name
    #SBATCH --job-name # Set meaningful job name
    #SBATCH --mail-user=your.email@domain.com
    #SBATCH -p your_partition
    #SBATCH -A your_account
+   MYNEWENV=""        # Set to your conda environment name
    CONFIG="your_config"
    CONFIG_PATH="path/to/config"
    ```
