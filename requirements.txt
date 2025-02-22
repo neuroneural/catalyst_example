@@ -4,6 +4,11 @@ torchaudio
 numpy
 nvidia-nccl-cu12
 pillow
-tqdm
 wandb
 tensorboardX
+catalyst
+mindfultensors
+pymongo
+nibabel
+pynvml
+scipy
