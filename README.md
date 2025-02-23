@@ -27,7 +27,7 @@ pip install -r requirements.txt
    #SBATCH -p your_partition
    #SBATCH -A your_account
    MYNEWENV=""        # Set to your conda environment name
-   CONFIG="your_config"
+   CONFIG_NAME="your_config"
    CONFIG_PATH="path/to/config"
    ```
 

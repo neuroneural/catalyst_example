@@ -21,9 +21,9 @@ echo $HOSTNAME >&2
 source ~/miniconda3/etc/profile.d/conda.sh
 
 MYNEWENV="torchenv"
-CONFIG="vanilla_3class_gn_11chan32.16.1_exp01"
+CONFIG_NAME="vanilla_3class_gn_11chan32.16.1_exp01"
 CONFIG_PATH="conf"
 
-conda run -n $MYNEWENV python curriculum_training.py --config $CONFIG --config_path $CONFIG_PATH
+conda run -n $MYNEWENV python curriculum_training.py --config-name $CONFIG_NAME --config-dir $CONFIG_PATH
 
 sleep 10s
