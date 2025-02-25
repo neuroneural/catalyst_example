@@ -650,7 +650,7 @@ def main(cfg: DictConfig):
             db_fields=dbfields[experiment],
             subvolume_shape=subvolume_shape,
             lowprecision=bit16,
-            lossweight=cfg.model.loss_weight,
+            lossweight = [w / sum(cfg.model.loss_weight) for w in cfg.model.loss_weight] if sum(cfg.model.loss_weight) != 0 else ValueError("The sum of loss weights cannot be zero."),
             meshnetme=cfg.model.use_me,
             db_host=db_host,
             wandb_team=cfg.wandb.team,
