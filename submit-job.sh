@@ -8,7 +8,7 @@
 #SBATCH -J your-job-name  # Job name
 #SBATCH -e error%A.err         # Error file
 #SBATCH -o out%A.out           # Output file
-#SBATCH -A psy53c17            # Account
+#SBATCH -A your-account            # Account
 #SBATCH --mail-type=ALL        # Mail notifications
 #SBATCH --mail-user=your-email@email.com
 #SBATCH --oversubscribe
@@ -20,6 +20,12 @@ echo $HOSTNAME >&2
 
 source ~/miniconda3/etc/profile.d/conda.sh
 
-conda run -n $MYNEWENV python curriculum_training.py
+MYNEWENV="catalyst"
+CONFIG_NAME="vanilla_3class_gn_11chan32.16.1_exp01"
+CONFIG_PATH="conf"
+
+conda activate $MYNEWENV
+
+python curriculum_training.py --config-name $CONFIG_NAME --config-dir $CONFIG_PATH
 
 sleep 10s
