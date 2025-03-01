@@ -1,10 +1,10 @@
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import os
 import random
 import shutil
 from packaging import version
-
+import yaml
 from catalyst import dl, metrics, utils
 from catalyst.data import BatchPrefetchLoaderWrapper
 
@@ -34,7 +34,7 @@ utils.set_global_seed(SEED)
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:100"
 os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
-# os.environ["NCCL_SOCKET_IFNAME"] = "ib0"
+os.environ["NCCL_SOCKET_IFNAME"] = "ib0"
 # os.environ["NCCL_P2P_LEVEL"] = "NVL"
 
 torch_version = torch.__version__
@@ -132,6 +132,7 @@ class CustomRunner(dl.Runner):
         meshnetme=False,
         lossweight=[1, 0],
         maxshape=300,
+        hparams=None,
     ):
         super().__init__()
         self._logdir = logdir
@@ -164,6 +165,7 @@ class CustomRunner(dl.Runner):
         self.meshnetme = meshnetme
         self.wandb_team = wandb_team
         self.maxshape = maxshape
+        self._hparams = hparams
 
     def get_engine(self):
         if torch.cuda.device_count() > 1:
@@ -625,6 +627,10 @@ def main(cfg: DictConfig):
         client_creator.set_num_subcubes(numcubes[experiment])
         client_creator.set_shape(subvolume_shape)
 
+        with open(cfg.model.config_file, 'r') as f:
+            config_dict = yaml.safe_load(f)
+            hparams = {"model_arch": config_dict, **OmegaConf.to_container(cfg)}
+
         runner = CustomRunner(
             logdir=logdir,
             wandb_project=wandb_project,
@@ -655,6 +661,7 @@ def main(cfg: DictConfig):
             db_host=db_host,
             wandb_team=cfg.wandb.team,
             maxshape=cfg.model.maxshape,
+            hparams=hparams,
         )
         runner.run()
 
