@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.functional import jvp
-from torch.utils.checkpoint import checkpoint_sequential
+from torch.utils.checkpoint import checkpoint_sequential, checkpoint
 import json
 from pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
 
@@ -133,15 +133,55 @@ class enMesh_checkpoint(MeshNet):
 
 
 class enMesh_fixedpoint(enMesh_checkpoint):
-    def train_forward(self, x):
+    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10):
+        super(enMesh_fixedpoint, self).__init__(in_channels, n_classes, channels, config_file)
+        self.max_iter = max_iter
+        self.n_classes = n_classes
+
+    def train_forward(self, x: torch.Tensor):
+        print_memory_stats("Before train_forward in enMesh_fixedpoint")
         x.requires_grad_()
-        for i in range(self.max_iter):
-            y = checkpoint_sequential(
-                self.model, len(self.model), y, preserve_rng_state=False
-            )
-            # need to prepend on the channel dimension a tensor x with self.channels as number of channels + N for the y channels
-            x = torch.cat([x, y], dim=1)
+        y = checkpoint(lambda x: x.repeat(1, self.n_classes, 1, 1, 1), x, use_reentrant=False)
+        
+        def forward_pass(x, layers):
+            for layer in layers:
+                x = checkpoint(layer, x, use_reentrant=False)
+            return x
+        def fixed_point_iterations(x: torch.Tensor, y: torch.Tensor):
+            
+            for _ in range(self.max_iter-1):
+                x = checkpoint(lambda y, x: torch.cat([y, x[:, -1:, :, :, :]], dim=1), y, x, use_reentrant=False)
+
+                y = checkpoint(forward_pass, x, self.model, use_reentrant=False)
+                # print(f"Iteration {i+1}")
+            return y
+        
+        y = fixed_point_iterations(x, y)
+
+        x = checkpoint(lambda y, x: torch.cat([y, x[:, -1:, :, :, :]], dim=1), y, x, use_reentrant=False)
+
+        # Apply checkpointing to all layers except the last one
+        y = checkpoint(forward_pass, x, self.model[:-1], use_reentrant=False)
+        y = self.model[-1](y)
+        # print_memory_stats("After train_forward in enMesh_fixedpoint")
+        
         return y
+    
+    def eval_forward(self, x: torch.Tensor):
+        # print_memory_stats("Before eval_forward in enMesh_fixedpoint")
+        y = torch.cat([x] * (self.n_classes), dim=1)
+        # print_memory_stats("After eval_forward in enMesh_fixedpoint")
+        for _ in range(self.max_iter):
+            y = torch.cat([y, x[:, -1:, :, :, :]], dim=1)
+            y = super().eval_forward(y)
+        return y
+
+def print_memory_stats(prefix=""):
+    if torch.cuda.is_available():
+        print(f"{prefix} GPU Memory: "
+                f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB, "
+                f"Cached: {torch.cuda.memory_reserved()/1e9:.2f}GB")
+
 # The above is of course a classical trade of computation for memory.  However, pytorch still caches a lot and thus uses more memory than needed. Below is my manual implementation that is slower than above, but most memory economical
 #
 # Why am I giving this slower model to you :) If you want to train on GPUs with 40GB or 48GB (e.g. A40) then the model below is helpful. I suspect this is not meshnet specific and u-net is also positively affected by what I am going to describe, but here is how I train meshnets.  Given training data and model architecture (mostly number of channels).
@@ -339,7 +379,9 @@ class enMesh(MeshNet):
         return lss_value, y_hat
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from torch.utils.checkpoint import checkpoint
+    from dice import DiceLoss
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
     channels = 5
     cubesize = 256
@@ -347,4 +389,31 @@ if __name__ == "__main__":
     batch = 1
     config_file = "modelAE.json"
 
-    emodel = enMesh_checkpoint(1, classes, channels, config_file).to(device)
+    emodel = enMesh_fixedpoint(4, classes, channels, config_file, 10).to(device)
+    # ckpt = torch.load('logs/tmp/synth3_11chn_32.16.1.gn/model.last.pth')
+    # emodel.load_state_dict(ckpt)
+    optimizer = torch.optim.Adam(emodel.parameters(), lr=0.001)
+
+    dummy_input = torch.randn(batch, 1, cubesize, cubesize, cubesize).to(device)
+    output = emodel.forward(dummy_input)
+
+    # Generate random target
+    target = torch.randint(0, 3, (1, 256, 256, 256)).to(device)
+
+    # Define loss functions
+    ce_criterion = torch.nn.CrossEntropyLoss()
+    dice_criterion = DiceLoss()
+
+    def combined_loss(output, target):
+        return ce_criterion(output, target) + dice_criterion(output, target)
+
+    loss = combined_loss(output, target)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    with torch.inference_mode():
+        output = emodel.forward(dummy_input)
+        print(output.shape)
+
+    # print(output.shape)

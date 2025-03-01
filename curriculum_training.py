@@ -1,10 +1,10 @@
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import os
 import random
 import shutil
 from packaging import version
-
+import yaml
 from catalyst import dl, metrics, utils
 from catalyst.data import BatchPrefetchLoaderWrapper
 
@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
 from dice import faster_dice, DiceLoss
-from meshnet import enMesh_checkpoint, enMesh
+from meshnet import enMesh_checkpoint, enMesh, enMesh_fixedpoint
 from meshnet_gn import enMesh_checkpoint as enMesh_checkpoint_gn
 from meshnetme import MeshNetME_checkpoint
 from mindfultensors.gencoords import CoordsGenerator
@@ -132,6 +132,9 @@ class CustomRunner(dl.Runner):
         meshnetme=False,
         lossweight=[1, 0],
         maxshape=300,
+        hparams=None,
+        max_iter=10,
+        in_channels=4,
     ):
         super().__init__()
         self._logdir = logdir
@@ -164,6 +167,9 @@ class CustomRunner(dl.Runner):
         self.meshnetme = meshnetme
         self.wandb_team = wandb_team
         self.maxshape = maxshape
+        self._hparams = hparams
+        self.max_iter = max_iter
+        self.in_channels = in_channels
 
     def get_engine(self):
         if torch.cuda.device_count() > 1:
@@ -300,27 +306,35 @@ class CustomRunner(dl.Runner):
         return {"train": tdataloader, "valid": vdataloader}
 
     def get_model(self):
-        if self.meshnetme:
-            modelClass = MeshNetME_checkpoint
-        else:
-            modelClass = (
-                enMesh_checkpoint_gn if self.groupnorm else enMesh_checkpoint
-            )
-        if self.shape > self.maxshape:
-            model = enMesh(
-                in_channels=1,
-                n_classes=self.n_classes,
-                channels=self.n_channels,
-                config_file=self.config_file,
-                optimize_inline=self.optimize_inline,
-            )
-        else:
-            model = modelClass(
-                in_channels=1,
-                n_classes=self.n_classes,
-                channels=self.n_channels,
-                config_file=self.config_file,
-            )
+        # if self.meshnetme:
+        #     modelClass = MeshNetME_checkpoint
+        # else:
+        #     modelClass = (
+        #         enMesh_checkpoint_gn if self.groupnorm else enMesh_checkpoint
+        #     )
+        # if self.shape > self.maxshape:
+        #     model = enMesh(
+        #         in_channels=1,
+        #         n_classes=self.n_classes,
+        #         channels=self.n_channels,
+        #         config_file=self.config_file,
+        #         optimize_inline=self.optimize_inline,
+        #     )
+        # else:
+        #     model = modelClass(
+        #         in_channels=1,
+        #         n_classes=self.n_classes,
+        #         channels=self.n_channels,
+        #         config_file=self.config_file,
+        #     )
+
+        model = enMesh_fixedpoint(
+            in_channels=self.in_channels,
+            n_classes=self.n_classes,
+            channels=self.n_channels,
+            config_file=self.config_file,
+            max_iter=self.max_iter,
+        )
         return model
 
     def get_criterion(self):
@@ -405,9 +419,7 @@ class CustomRunner(dl.Runner):
             torch.cuda.synchronize()
         
         sample, label = batch
-        # np.save("labels.npy", label.cpu().numpy())
-        # np.save("input.npy", sample.cpu().numpy())
-        # stop
+
         # run model forward/backward pass
         if self.model.training:
             if self.shape > self.maxshape:
@@ -430,9 +442,6 @@ class CustomRunner(dl.Runner):
                         device_type="cuda", dtype=torch.float16
                     ):
                         y_hat = self.model.forward(sample)
-                        # print("y_hat.shape: ", y_hat.shape)
-                        # print("label.shape: ", label.shape)
-                        # stop
 
                         loss = self.criterion(y_hat, label)
                     scaler.scale(loss).backward()
@@ -451,7 +460,7 @@ class CustomRunner(dl.Runner):
                     self.scheduler.step()
                     self.optimizer.zero_grad()
         else:
-            with torch.no_grad():
+            with torch.inference_mode():
                 y_hat = self.model.forward(sample)
                 loss = self.criterion(y_hat, label)
         with torch.inference_mode():
@@ -625,6 +634,10 @@ def main(cfg: DictConfig):
         client_creator.set_num_subcubes(numcubes[experiment])
         client_creator.set_shape(subvolume_shape)
 
+        with open(cfg.model.config_file, 'r') as f:
+            config_dict = yaml.safe_load(f)
+            hparams = {"model_arch": config_dict, **OmegaConf.to_container(cfg)}
+
         runner = CustomRunner(
             logdir=logdir,
             wandb_project=wandb_project,
@@ -655,6 +668,7 @@ def main(cfg: DictConfig):
             db_host=db_host,
             wandb_team=cfg.wandb.team,
             maxshape=cfg.model.maxshape,
+            hparams=hparams,
         )
         runner.run()
 
