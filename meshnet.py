@@ -139,7 +139,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
         self.n_classes = n_classes
 
     def train_forward(self, x: torch.Tensor):
-        print_memory_stats("Before train_forward in enMesh_fixedpoint")
+        # print_memory_stats("Before train_forward in enMesh_fixedpoint")
         x.requires_grad_()
         y = checkpoint(lambda x: x.repeat(1, self.n_classes, 1, 1, 1), x, use_reentrant=False)
         
@@ -149,7 +149,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
             return x
         def fixed_point_iterations(x: torch.Tensor, y: torch.Tensor):
             
-            for _ in range(self.max_iter-1):
+            for _ in range(self.max_iter):
                 x = checkpoint(lambda y, x: torch.cat([y, x[:, -1:, :, :, :]], dim=1), y, x, use_reentrant=False)
 
                 y = checkpoint(forward_pass, x, self.model, use_reentrant=False)
@@ -158,11 +158,11 @@ class enMesh_fixedpoint(enMesh_checkpoint):
         
         y = fixed_point_iterations(x, y)
 
-        x = checkpoint(lambda y, x: torch.cat([y, x[:, -1:, :, :, :]], dim=1), y, x, use_reentrant=False)
+        # x = checkpoint(lambda y, x: torch.cat([y, x[:, -1:, :, :, :]], dim=1), y, x, use_reentrant=False)
 
         # Apply checkpointing to all layers except the last one
-        y = checkpoint(forward_pass, x, self.model[:-1], use_reentrant=False)
-        y = self.model[-1](y)
+        # y = checkpoint(forward_pass, x, self.model[:-1], use_reentrant=False)
+        # y = self.model[-1](y)
         # print_memory_stats("After train_forward in enMesh_fixedpoint")
         
         return y
