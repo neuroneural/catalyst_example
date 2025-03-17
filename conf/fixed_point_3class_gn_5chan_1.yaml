@@ -11,14 +11,14 @@ mongo:
 
 wandb:
   team: "hydra-meshnet"
-  project: "fixedpoint_iteration_4"
+  project: "fixedpoint_iteration_5"
 
 bit16: False
 
 model:
   n_classes: 3
   model_channels: 5
-  model_label: "_5chn_4.gn"
+  model_label: "_5chn_5.gn"
   config_file: "./modelAE.json"
   volume_shape: [256, 256, 256]
   maxshape: 300
@@ -31,8 +31,8 @@ model:
 
 paths:
   loadcheckpoint: False
-  model: "./logs/tmp/fxpnt_synth_5chn_4.gn/model.last.pth"
-  logdir: "./logs/tmp/fxpnt_synth_5chn_4/"
+  model: "./logs/tmp/fxpnt_synth_5chn_5.gn/model.last.pth"
+  logdir: "./logs/tmp/fxpnt_synth_5chn_5/"
 
 client_creator:
   crop_tensor: False
