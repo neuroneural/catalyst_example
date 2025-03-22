@@ -170,7 +170,7 @@ class CustomRunner(dl.Runner):
         self._hparams = hparams
         self.max_iter = max_iter
         self.in_channels = in_channels
-
+        self.convergence_iters = []
     def get_engine(self):
         if torch.cuda.device_count() > 1:
             return dl.DistributedDataParallelEngine(
@@ -410,6 +410,7 @@ class CustomRunner(dl.Runner):
         """
         for key in ["loss", "macro_dice", "learning rate"]:
             self.loader_metrics[key] = self.meters[key].compute()[0]
+        self.loader_metrics["convergence_iters"] = self.convergence_iters
         super().on_loader_end(runner)
 
     # model train/valid step
@@ -436,6 +437,7 @@ class CustomRunner(dl.Runner):
                     loss, y_hat = self.model.forward(
                         x=sample, y=label, loss=self.criterion, verbose=False
                     )
+                self.convergence_iters.append(self.model.convergence_iters.cpu().numpy().tolist())
             else:
                 if self.bit16:
                     with torch.amp.autocast(

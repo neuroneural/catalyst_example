@@ -118,7 +118,7 @@ class enMesh_checkpoint(MeshNet):
         )
         return y
 
-    def eval_forward(self, x):
+    def eval_forward(self, x: torch.Tensor):
         """Forward pass"""
         self.model.eval()
         with torch.inference_mode():
@@ -133,54 +133,76 @@ class enMesh_checkpoint(MeshNet):
 
 
 class enMesh_fixedpoint(enMesh_checkpoint):
-    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10):
+    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10, tol=1e-5):
         super(enMesh_fixedpoint, self).__init__(in_channels, n_classes, channels, config_file)
         self.max_iter = max_iter
         self.n_classes = n_classes
+        self.tol = tol
 
     def train_forward(self, x: torch.Tensor):
-        # print_memory_stats("Before train_forward in enMesh_fixedpoint")
         x.requires_grad_()
         y = x.repeat(1, self.n_classes, 1, 1, 1)
+        batch_size = x.shape[0]
+        self.convergence_iters = torch.zeros(batch_size, dtype=torch.int32, device=x.device, requires_grad=False)
         
         def forward_pass(x, layers):
             for layer in layers:
                 x = checkpoint(layer, x, use_reentrant=False)
             return x
-        def fixed_point_iterations(x: torch.Tensor, y: torch.Tensor):
-            
-            for _ in range(self.max_iter):
-                y = torch.cat([y, x], dim=1)
 
-                y = checkpoint(forward_pass, y, self.model, use_reentrant=False)
-                # print(f"Iteration {i+1}")
+        def fixed_point_iterations(x: torch.Tensor, y: torch.Tensor):
+            prev_y = None
+            converged = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
+            
+            for i in range(self.max_iter):
+                y_current = torch.cat([y, x], dim=1)
+                y = checkpoint(forward_pass, y_current, self.model, use_reentrant=False)
+                
+                if prev_y is not None:
+                    diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
+                    newly_converged = diff < self.tol
+                    
+                    # Increment iterations for non-converged samples before updating convergence status
+                    self.convergence_iters += (~converged).int()
+                    
+                    # Update convergence status
+                    converged |= newly_converged
+                    
+                    y = torch.where(converged.view(-1, 1, 1, 1, 1), prev_y, y)
+                    
+                    if converged.all():
+                        break
+                prev_y = y.detach()
             return y
         
         y = fixed_point_iterations(x, y)
-
-        # x = checkpoint(lambda y, x: torch.cat([y, x[:, -1:, :, :, :]], dim=1), y, x, use_reentrant=False)
-
-        # Apply checkpointing to all layers except the last one
-        # y = checkpoint(forward_pass, x, self.model[:-1], use_reentrant=False)
-        # y = self.model[-1](y)
-        # print_memory_stats("After train_forward in enMesh_fixedpoint")
-        
         return y
     
     def eval_forward(self, x: torch.Tensor):
-        # print_memory_stats("Before eval_forward in enMesh_fixedpoint")
         y = x.repeat(1, self.n_classes, 1, 1, 1)
-        # print_memory_stats("After eval_forward in enMesh_fixedpoint")
-        for _ in range(self.max_iter):
-            y = torch.cat([y, x], dim=1)
-            y = super().eval_forward(y)
+        batch_size = x.shape[0]
+        prev_y = None
+        converged = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
+
+        self.convergence_iters = torch.zeros(batch_size, dtype=torch.int32, device=x.device)
+        
+        for i in range(self.max_iter):
+            y_current = torch.cat([y, x], dim=1)
+            y = super().eval_forward(y_current)
+            
+            if prev_y is not None:
+                diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
+                newly_converged = diff < self.tol
+                self.convergence_iters += (~converged).int()
+                converged |= newly_converged
+                
+                y = torch.where(converged.view(-1, 1, 1, 1, 1), prev_y, y)
+                
+                if converged.all():
+                    break
+            prev_y = y.detach()
         return y
 
-def print_memory_stats(prefix=""):
-    if torch.cuda.is_available():
-        print(f"{prefix} GPU Memory: "
-                f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB, "
-                f"Cached: {torch.cuda.memory_reserved()/1e9:.2f}GB")
 
 # The above is of course a classical trade of computation for memory.  However, pytorch still caches a lot and thus uses more memory than needed. Below is my manual implementation that is slower than above, but most memory economical
 #
