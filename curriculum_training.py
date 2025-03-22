@@ -669,6 +669,7 @@ def main(cfg: DictConfig):
             wandb_team=cfg.wandb.team,
             maxshape=cfg.model.maxshape,
             hparams=hparams,
+            max_iter=cfg.model.max_iter,
         )
         runner.run()
 

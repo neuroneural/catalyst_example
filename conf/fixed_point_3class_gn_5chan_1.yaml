@@ -26,7 +26,7 @@ model:
   use_groupnorm: True
   use_me: False
   loss_weight: [1, 0]
-  max_iter: 10
+  max_iter: 1
   in_channels: 4
 
 paths:
