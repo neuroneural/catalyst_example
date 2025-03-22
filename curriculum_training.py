@@ -135,6 +135,7 @@ class CustomRunner(dl.Runner):
         hparams=None,
         max_iter=10,
         in_channels=4,
+        tolerance=1e-5,
     ):
         super().__init__()
         self._logdir = logdir
@@ -171,6 +172,7 @@ class CustomRunner(dl.Runner):
         self.max_iter = max_iter
         self.in_channels = in_channels
         self.convergence_iters = []
+        self.tolerance = tolerance
     def get_engine(self):
         if torch.cuda.device_count() > 1:
             return dl.DistributedDataParallelEngine(
@@ -334,6 +336,7 @@ class CustomRunner(dl.Runner):
             channels=self.n_channels,
             config_file=self.config_file,
             max_iter=self.max_iter,
+            tolerance=self.tolerance,
         )
         return model
 
@@ -671,6 +674,8 @@ def main(cfg: DictConfig):
             wandb_team=cfg.wandb.team,
             maxshape=cfg.model.maxshape,
             hparams=hparams,
+            max_iter=cfg.model.max_iter,
+            tolerance=cfg.model.tolerance,
         )
         runner.run()
 

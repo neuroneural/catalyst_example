@@ -28,6 +28,7 @@ model:
   loss_weight: [1, 0]
   max_iter: 10
   in_channels: 4
+  tolerance: 1e-5
 
 paths:
   loadcheckpoint: False

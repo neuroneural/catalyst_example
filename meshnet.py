@@ -133,11 +133,11 @@ class enMesh_checkpoint(MeshNet):
 
 
 class enMesh_fixedpoint(enMesh_checkpoint):
-    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10, tol=1e-5):
+    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10, tolerance=1e-5):
         super(enMesh_fixedpoint, self).__init__(in_channels, n_classes, channels, config_file)
         self.max_iter = max_iter
         self.n_classes = n_classes
-        self.tol = tol
+        self.tolerance = tolerance
 
     def train_forward(self, x: torch.Tensor):
         x.requires_grad_()
@@ -160,7 +160,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
                 
                 if prev_y is not None:
                     diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
-                    newly_converged = diff < self.tol
+                    newly_converged = diff < self.tolerance
                     
                     # Increment iterations for non-converged samples before updating convergence status
                     self.convergence_iters += (~converged).int()
@@ -192,7 +192,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
             
             if prev_y is not None:
                 diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
-                newly_converged = diff < self.tol
+                newly_converged = diff < self.tolerance
                 self.convergence_iters += (~converged).int()
                 converged |= newly_converged
                 
