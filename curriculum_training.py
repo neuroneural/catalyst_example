@@ -1,3 +1,4 @@
+from collections import defaultdict
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import os
@@ -7,6 +8,7 @@ from packaging import version
 import yaml
 from catalyst import dl, metrics, utils
 from catalyst.data import BatchPrefetchLoaderWrapper
+import wandb
 
 import torch
 from torch.optim.lr_scheduler import OneCycleLR
@@ -171,7 +173,7 @@ class CustomRunner(dl.Runner):
         self._hparams = hparams
         self.max_iter = max_iter
         self.in_channels = in_channels
-        self.convergence_iters = []
+        self.convergence_iters = defaultdict(list)
         self.tolerance = tolerance
     def get_engine(self):
         if torch.cuda.device_count() > 1:
@@ -413,8 +415,12 @@ class CustomRunner(dl.Runner):
         """
         for key in ["loss", "macro_dice", "learning rate"]:
             self.loader_metrics[key] = self.meters[key].compute()[0]
-        self.loader_metrics["convergence_iters"] = self.convergence_iters
         super().on_loader_end(runner)
+    
+    def on_experiment_end(self, runner):
+        for logger in self.loggers.values():
+            wandb.log(self.convergence_iters)
+        super().on_experiment_end(runner)
 
     # model train/valid step
     def handle_batch(self, batch):
@@ -440,7 +446,7 @@ class CustomRunner(dl.Runner):
                     loss, y_hat = self.model.forward(
                         x=sample, y=label, loss=self.criterion, verbose=False
                     )
-                self.convergence_iters.append(self.model.convergence_iters.cpu().numpy().tolist())
+                self.convergence_iters[self.epoch_step].extend(self.model.convergence_iters.cpu().numpy().tolist())
             else:
                 if self.bit16:
                     with torch.amp.autocast(
