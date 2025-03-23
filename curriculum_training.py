@@ -174,6 +174,7 @@ class CustomRunner(dl.Runner):
         self.max_iter = max_iter
         self.in_channels = in_channels
         self.convergence_iters = defaultdict(list)
+        self.convergence_diffs = defaultdict(list)
         self.tolerance = tolerance
     def get_engine(self):
         if torch.cuda.device_count() > 1:
@@ -418,8 +419,8 @@ class CustomRunner(dl.Runner):
         super().on_loader_end(runner)
     
     def on_experiment_end(self, runner):
-        for logger in self.loggers.values():
-            wandb.log(self.convergence_iters)
+        wandb.log(self.convergence_iters)
+        wandb.log(self.convergence_diffs)
         super().on_experiment_end(runner)
 
     # model train/valid step
@@ -447,6 +448,7 @@ class CustomRunner(dl.Runner):
                         x=sample, y=label, loss=self.criterion, verbose=False
                     )
                 self.convergence_iters[self.epoch_step].extend(self.model.convergence_iters.cpu().numpy().tolist())
+                self.convergence_diffs[self.epoch_step].extend(self.model.convergence_diffs.cpu().numpy().tolist())
             else:
                 if self.bit16:
                     with torch.amp.autocast(

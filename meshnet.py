@@ -144,6 +144,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
         y = x.repeat(1, self.n_classes, 1, 1, 1)
         batch_size = x.shape[0]
         self.convergence_iters = torch.zeros(batch_size, dtype=torch.int32, device=x.device, requires_grad=False)
+        self.convergence_diffs = torch.zeros(batch_size, dtype=torch.float32, device=x.device, requires_grad=False)
         
         def forward_pass(x, layers):
             for layer in layers:
@@ -173,6 +174,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
                     if converged.all():
                         break
                 prev_y = y.detach()
+            self.convergence_diffs = diff.detach().cpu().numpy()
             return y
         
         y = fixed_point_iterations(x, y)
@@ -184,7 +186,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
         prev_y = None
         converged = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
 
-        self.convergence_iters = torch.zeros(batch_size, dtype=torch.int32, device=x.device)
+        # self.convergence_iters = torch.zeros(batch_size, dtype=torch.int32, device=x.device)
         
         for i in range(self.max_iter):
             y_current = torch.cat([y, x], dim=1)
@@ -193,7 +195,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
             if prev_y is not None:
                 diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
                 newly_converged = diff < self.tolerance
-                self.convergence_iters += (~converged).int()
+                # self.convergence_iters += (~converged).int()
                 converged = converged | newly_converged
                 
                 y = torch.where(converged.view(-1, 1, 1, 1, 1), prev_y, y)
@@ -201,6 +203,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
                 if converged.all():
                     break
             prev_y = y.detach()
+        # self.convergence_diffs = diff.detach().cpu().numpy()
         return y
 
 
