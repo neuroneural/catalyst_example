@@ -166,7 +166,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
                     self.convergence_iters += (~converged).int()
                     
                     # Update convergence status
-                    converged |= newly_converged
+                    converged = converged | newly_converged
                     
                     y = torch.where(converged.view(-1, 1, 1, 1, 1), prev_y, y)
                     
@@ -194,7 +194,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
                 diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
                 newly_converged = diff < self.tolerance
                 self.convergence_iters += (~converged).int()
-                converged |= newly_converged
+                converged = converged | newly_converged
                 
                 y = torch.where(converged.view(-1, 1, 1, 1, 1), prev_y, y)
                 
