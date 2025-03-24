@@ -335,6 +335,7 @@ class CustomRunner(dl.Runner):
             config_file=self.config_file,
             max_iter=self.max_iter,
         )
+        print(model)
         return model
 
     def get_criterion(self):
@@ -636,6 +637,8 @@ def main(cfg: DictConfig):
 
         with open(cfg.model.config_file, 'r') as f:
             config_dict = yaml.safe_load(f)
+            # Update input channels in config dict
+            config_dict["layers"][0]["in_channels"] = cfg.model.in_channels
             hparams = {"model_arch": config_dict, **OmegaConf.to_container(cfg)}
 
         runner = CustomRunner(
@@ -670,6 +673,7 @@ def main(cfg: DictConfig):
             maxshape=cfg.model.maxshape,
             hparams=hparams,
             max_iter=cfg.model.max_iter,
+            in_channels=cfg.model.in_channels,
         )
         runner.run()
 
