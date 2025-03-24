@@ -136,12 +136,12 @@ class enMesh_fixedpoint(enMesh_checkpoint):
     def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10, tolerance=1e-5):
         super(enMesh_fixedpoint, self).__init__(in_channels, n_classes, channels, config_file)
         self.max_iter = max_iter
-        self.n_classes = n_classes
+        self.n_channels = channels
         self.tolerance = tolerance
 
     def train_forward(self, x: torch.Tensor):
         x.requires_grad_()
-        y = x.repeat(1, self.n_classes, 1, 1, 1)
+        y = x.repeat(1, self.n_channels, 1, 1, 1)
         batch_size = x.shape[0]
         self.convergence_iters = torch.zeros(batch_size, dtype=torch.int32, device=x.device, requires_grad=False)
         self.convergence_diffs = torch.zeros(batch_size, dtype=torch.float32, device=x.device, requires_grad=False)
@@ -157,7 +157,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
             
             for i in range(self.max_iter):
                 y_current = torch.cat([y, x], dim=1)
-                y = checkpoint(forward_pass, y_current, self.model, use_reentrant=False)
+                y = checkpoint(forward_pass, y_current, self.model[:-1], use_reentrant=False)
                 
                 if prev_y is not None:
                     diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
@@ -178,10 +178,11 @@ class enMesh_fixedpoint(enMesh_checkpoint):
             return y
         
         y = fixed_point_iterations(x, y)
+        y = self.model[-1](y)
         return y
     
     def eval_forward(self, x: torch.Tensor):
-        y = x.repeat(1, self.n_classes, 1, 1, 1)
+        y = x.repeat(1, self.n_channels, 1, 1, 1)
         batch_size = x.shape[0]
         prev_y = None
         converged = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
@@ -203,6 +204,8 @@ class enMesh_fixedpoint(enMesh_checkpoint):
                 if converged.all():
                     break
             prev_y = y.detach()
+        
+        y = self.model[-1](y)
         # self.convergence_diffs = diff.detach().cpu().numpy()
         return y
 
