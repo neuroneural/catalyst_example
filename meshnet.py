@@ -188,24 +188,25 @@ class enMesh_fixedpoint(enMesh_checkpoint):
         converged = torch.zeros(batch_size, dtype=torch.bool, device=x.device)
 
         # self.convergence_iters = torch.zeros(batch_size, dtype=torch.int32, device=x.device)
-        
-        for i in range(self.max_iter):
-            y_current = torch.cat([y, x], dim=1)
-            y = super().eval_forward(y_current)
+        self.model.eval()
+        with torch.inference_mode():
+            for i in range(self.max_iter):
+                y_current = torch.cat([y, x], dim=1)
+                y = self.model[:-1](y_current)
             
-            if prev_y is not None:
-                diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
-                newly_converged = diff < self.tolerance
-                # self.convergence_iters += (~converged).int()
-                converged = converged | newly_converged
-                
-                y = torch.where(converged.view(-1, 1, 1, 1, 1), prev_y, y)
-                
-                if converged.all():
-                    break
-            prev_y = y.detach()
-        
-        y = self.model[-1](y)
+                if prev_y is not None:
+                    diff = torch.norm((y - prev_y).view(batch_size, -1), dim=1)
+                    newly_converged = diff < self.tolerance
+                    # self.convergence_iters += (~converged).int()
+                    converged = converged | newly_converged
+                    
+                    y = torch.where(converged.view(-1, 1, 1, 1, 1), prev_y, y)
+                    
+                    if converged.all():
+                        break
+                prev_y = y.detach()
+            
+            y = self.model[-1](y)
         # self.convergence_diffs = diff.detach().cpu().numpy()
         return y
 
