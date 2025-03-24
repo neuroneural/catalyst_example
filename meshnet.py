@@ -161,10 +161,12 @@ class enMesh_fixedpoint(enMesh_checkpoint):
     
     def eval_forward(self, x: torch.Tensor):
         y = x.repeat(1, self.n_channels, 1, 1, 1)
-        for _ in range(self.max_iter):
-            y = torch.cat([y, x], dim=1)
-            y = super().eval_forward(y)
-        y = self.model[-1](y)
+        self.model.eval()
+        with torch.inference_mode():
+            for _ in range(self.max_iter):
+                y = torch.cat([y, x], dim=1)
+                y = self.model[:-1](y)
+            y = self.model[-1](y)
         return y
 
 def print_memory_stats(prefix=""):
