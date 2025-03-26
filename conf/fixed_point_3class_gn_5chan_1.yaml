@@ -32,7 +32,7 @@ model:
 paths:
   loadcheckpoint: False
   model: "./logs/tmp/fxpnt_synth_5chn_5-maxiter-1.gn/model.last.pth"
-  logdir: "./logs/tmp/fxpnt_synth_5chn_5-maxiter-1/"
+  logdir: "./logs/tmp/fxpnt_synth_5chn_5-maxiter-1.gn/"
 
 client_creator:
   crop_tensor: False
