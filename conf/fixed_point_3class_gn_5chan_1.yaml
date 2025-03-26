@@ -13,7 +13,7 @@ wandb:
   team: "hydra-meshnet"
   project: "fixedpoint_iteration_5-maxiter-1"
 
-bit16: False
+bit16: True
 
 model:
   n_classes: 3
@@ -39,13 +39,13 @@ client_creator:
 
 experiment:
   lr_scale: 0.01
-  maxreps: 5
+  maxreps: 3
   cubesizes_code: |
-    [32, 64, 128, 192, 256]
+    [256, 256, 256]
   numcubes_code: |
-    [64, 32, 16, 1, 1]
+    [1, 1, 1]
   numvolumes_code: |
-    [1, 1, 1, 3, 3]
+    [1, 1, 1]
   weights_code: |
     [1] * maxreps
   databases_code: |
@@ -55,7 +55,7 @@ experiment:
   dbfields_code: |
     [("T1", "label3")] * maxreps
   epochs_code: |
-    [10] * (maxreps-2) + [50, 100]
+    [10] * maxreps
   prefetches_code: |
     [24] * maxreps
   attenuates_code: |
