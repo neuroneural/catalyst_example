@@ -140,7 +140,8 @@ class enMesh_fixedpoint(enMesh_checkpoint):
 
     def train_forward(self, x: torch.Tensor):
         x.requires_grad_()
-        y = x.repeat(1, self.n_channels, 1, 1, 1)
+        # y = x.repeat(1, self.n_channels, 1, 1, 1)
+        y = torch.zeros(x.shape[0], self.n_channels, *x.shape[2:]).to(x.device)
         
         def forward_pass(x, layers):
             for layer in layers:
@@ -160,7 +161,8 @@ class enMesh_fixedpoint(enMesh_checkpoint):
         return y
     
     def eval_forward(self, x: torch.Tensor):
-        y = x.repeat(1, self.n_channels, 1, 1, 1)
+        # y = x.repeat(1, self.n_channels, 1, 1, 1)
+        y = torch.zeros(x.shape[0], self.n_channels, *x.shape[2:]).to(x.device)
         self.model.eval()
         with torch.inference_mode():
             for _ in range(self.max_iter):

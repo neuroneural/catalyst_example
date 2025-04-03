@@ -597,6 +597,7 @@ def main(cfg: DictConfig):
     epochs = eval(cfg.experiment.epochs_code, globals(), context)
     prefetches = eval(cfg.experiment.prefetches_code, globals(), context)
     attenuates = eval(cfg.experiment.attenuates_code, globals(), context)
+    max_iters = eval(cfg.experiment.max_iters, globals(), context)
 
     assert_equal_length(
         cubesizes,
@@ -610,7 +611,7 @@ def main(cfg: DictConfig):
         attenuates,
     )
 
-    start_experiment = 0
+    start_experiment = 2
     for experiment in range(len(cubesizes)):
         subvolume_shape = [cubesizes[experiment]] * 3
         onecycle_lr = rmsprop_lr = (
@@ -672,7 +673,7 @@ def main(cfg: DictConfig):
             wandb_team=cfg.wandb.team,
             maxshape=cfg.model.maxshape,
             hparams=hparams,
-            max_iter=cfg.model.max_iter,
+            max_iter=max_iters[experiment],
             in_channels=cfg.model.in_channels,
         )
         runner.run()
