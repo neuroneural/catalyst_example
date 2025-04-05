@@ -611,7 +611,7 @@ def main(cfg: DictConfig):
         attenuates,
     )
 
-    start_experiment = 2
+    start_experiment = 0
     for experiment in range(len(cubesizes)):
         subvolume_shape = [cubesizes[experiment]] * 3
         onecycle_lr = rmsprop_lr = (

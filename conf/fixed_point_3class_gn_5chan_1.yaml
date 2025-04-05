@@ -38,7 +38,7 @@ client_creator:
   crop_tensor: False
 
 experiment:
-  lr_scale: 0.01
+  lr_scale: 0.001
   maxreps: 5
   cubesizes_code: |
     [32, 64, 128, 192, 256]
@@ -61,4 +61,4 @@ experiment:
   attenuates_code: |
     [0.9] * maxreps
   max_iters: |
-    [1, 1, 1, 4, 10]
+    [1, 2, 4, 8, 10]
