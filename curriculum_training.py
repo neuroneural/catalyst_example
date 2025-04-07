@@ -102,6 +102,7 @@ class ProductScheduler:
 class CustomRunner(dl.Runner):
     def __init__(
         self,
+        cfg: DictConfig,
         logdir: str,
         wandb_project: str,
         wandb_experiment: str,
@@ -137,6 +138,7 @@ class CustomRunner(dl.Runner):
         in_channels=4,
     ):
         super().__init__()
+        self.cfg = cfg
         self._logdir = logdir
         self.wandb_project = wandb_project
         self.wandb_experiment = wandb_experiment
@@ -174,6 +176,7 @@ class CustomRunner(dl.Runner):
     def get_engine(self):
         if torch.cuda.device_count() > 1:
             return dl.DistributedDataParallelEngine(
+                port=random.randint(10000, 65535),
                 # mixed_precision="fp16",
                 # ddp_kwargs={"backend": "nccl"},
                 process_group_kwargs={"backend": "nccl"},
@@ -334,6 +337,7 @@ class CustomRunner(dl.Runner):
             channels=self.n_channels,
             config_file=self.config_file,
             max_iter=self.max_iter,
+            iter_every_n_layers=self.cfg.experiment.iter_every_n_layers,
         )
         print(model)
         return model
@@ -609,6 +613,7 @@ def main(cfg: DictConfig):
         epochs,
         prefetches,
         attenuates,
+        max_iters,
     )
 
     start_experiment = 0
@@ -643,6 +648,7 @@ def main(cfg: DictConfig):
             hparams = {"model_arch": config_dict, **OmegaConf.to_container(cfg)}
 
         runner = CustomRunner(
+            cfg=cfg,
             logdir=logdir,
             wandb_project=wandb_project,
             wandb_experiment=wandb_experiment,

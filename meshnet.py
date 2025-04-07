@@ -133,42 +133,54 @@ class enMesh_checkpoint(MeshNet):
 
 
 class enMesh_fixedpoint(enMesh_checkpoint):
-    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10):
+    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10, iter_every_n_layers=None):
         super(enMesh_fixedpoint, self).__init__(in_channels, n_classes, channels, config_file)
         self.max_iter = max_iter
         self.n_channels = channels
+        self.iter_every_n_layers = iter_every_n_layers or len(self.model) - 1
+        if self.iter_every_n_layers>=len(self.model):
+            raise ValueError(f"iter_every_n_layers must be less than the number of layers in the model; iter_every_n_layers = {self.iter_every_n_layers} >= {len(self.model)}")
+
+
+    def forward_pass(self, x, layers):
+        for layer in layers:
+            if self.training:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+        return x
+    def fixed_point_iterations(self, x: torch.Tensor):
+        # First layer not included in fixed point iterations
+        x = self.model[0](x)
+
+        n_layers = len(self.model)
+        y = torch.zeros(x.shape[0], self.n_channels, *x.shape[2:]).to(x.device)
+        for start_layer in range(1, n_layers-1, self.iter_every_n_layers):
+            end_layer = min(start_layer + self.iter_every_n_layers, n_layers-1)
+
+            for _ in range(self.max_iter):
+                print("Iteration", _)
+                assert y.shape == x.shape, f"y.shape = {y.shape} != x.shape = {x.shape}"
+                x = 0.1*y + x
+                if self.training:
+                    y = checkpoint(self.forward_pass, x, self.model[start_layer:end_layer], use_reentrant=False)
+                else:
+                    y = self.forward_pass(x, self.model[start_layer:end_layer])
+        
+        # Last layer not included in fixed point iterations
+        y = self.model[-1](y)
+        return y
 
     def train_forward(self, x: torch.Tensor):
         x.requires_grad_()
-        # y = x.repeat(1, self.n_channels, 1, 1, 1)
-        y = torch.zeros(x.shape[0], self.n_channels, *x.shape[2:]).to(x.device)
-        
-        def forward_pass(x, layers):
-            for layer in layers:
-                x = checkpoint(layer, x, use_reentrant=False)
-            return x
-        def fixed_point_iterations(x: torch.Tensor, y: torch.Tensor):
-            
-            for _ in range(self.max_iter):
-                y = torch.cat([y, x], dim=1)
-
-                y = checkpoint(forward_pass, y, self.model[:-1], use_reentrant=False)
-            return y
-        
-        y = fixed_point_iterations(x, y)
-        y = self.model[-1](y)
-        
+        y = self.fixed_point_iterations(x)
         return y
     
     def eval_forward(self, x: torch.Tensor):
-        # y = x.repeat(1, self.n_channels, 1, 1, 1)
-        y = torch.zeros(x.shape[0], self.n_channels, *x.shape[2:]).to(x.device)
         self.model.eval()
+        print("Evaluating fixed point iterations")
         with torch.inference_mode():
-            for _ in range(self.max_iter):
-                y = torch.cat([y, x], dim=1)
-                y = self.model[:-1](y)
-            y = self.model[-1](y)
+            y = self.fixed_point_iterations(x)
         return y
 
 def print_memory_stats(prefix=""):
@@ -384,7 +396,7 @@ if __name__ == "__main__":
     batch = 1
     config_file = "modelAE.json"
 
-    emodel = enMesh_fixedpoint(4, classes, channels, config_file, 10).to(device)
+    emodel = enMesh_fixedpoint(1, classes, channels, config_file, 10).to(device)
     # ckpt = torch.load('logs/tmp/synth3_11chn_32.16.1.gn/model.last.pth')
     # emodel.load_state_dict(ckpt)
     optimizer = torch.optim.Adam(emodel.parameters(), lr=0.001)

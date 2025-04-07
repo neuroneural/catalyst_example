@@ -27,7 +27,7 @@ model:
   use_me: False
   loss_weight: [1, 0]
 #   max_iter: 1
-  in_channels: 6
+  in_channels: 1
 
 paths:
   loadcheckpoint: False
@@ -38,8 +38,9 @@ client_creator:
   crop_tensor: False
 
 experiment:
-  lr_scale: 0.001
+  lr_scale: 0.01
   maxreps: 5
+  iter_every_n_layers: 3 # When set to None, the number of layers-1 is used –– it runs fixed point iterations on all layers
   cubesizes_code: |
     [32, 64, 128, 192, 256]
   numcubes_code: |
@@ -61,4 +62,4 @@ experiment:
   attenuates_code: |
     [0.9] * maxreps
   max_iters: |
-    [1, 2, 4, 8, 10]
+    [2, 2, 2, 2, 2]
