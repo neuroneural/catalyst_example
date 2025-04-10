@@ -159,7 +159,6 @@ class enMesh_fixedpoint(enMesh_checkpoint):
             end_layer = min(start_layer + self.iter_every_n_layers, n_layers-1)
 
             for _ in range(self.max_iter):
-                print("Iteration", _)
                 assert y.shape == x.shape, f"y.shape = {y.shape} != x.shape = {x.shape}"
                 x = 0.1*y + x
                 if self.training:
@@ -178,7 +177,6 @@ class enMesh_fixedpoint(enMesh_checkpoint):
     
     def eval_forward(self, x: torch.Tensor):
         self.model.eval()
-        print("Evaluating fixed point iterations")
         with torch.inference_mode():
             y = self.fixed_point_iterations(x)
         return y
