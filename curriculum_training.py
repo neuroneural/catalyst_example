@@ -221,7 +221,7 @@ class CustomRunner(dl.Runner):
     def get_loaders(self):
         self.funcs = {
             "createclient": self.client_creator.create_client,
-            "createVclient": self.client_creator.create_v_client,
+            "createVclient": self.client_creator.create_client,
             "mycollate": self.client_creator.mycollate,
             "mycollate_full": self.client_creator.mycollate_full,
             "mytransform": self.client_creator.mytransform,

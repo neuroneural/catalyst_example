@@ -54,7 +54,12 @@ def construct_layer(dropout_p=0, bnorm=True, gelu=False, *args, **kwargs):
     if bnorm:
         # track_running_stats=False is needed to run the forward mode AD
         layers.append(
-            nn.BatchNorm3d(kwargs["out_channels"], track_running_stats=True)
+            # nn.BatchNorm3d(kwargs["out_channels"], track_running_stats=True)
+            nn.GroupNorm(
+                num_groups=kwargs["out_channels"],
+                num_channels=kwargs["out_channels"],
+                affine=False,
+            )
         )
     layers.append(nn.ELU(inplace=True) if gelu else nn.ReLU(inplace=True))
     if dropout_p > 0:
@@ -160,11 +165,11 @@ class enMesh_fixedpoint(enMesh_checkpoint):
 
             for _ in range(self.max_iter):
                 assert y.shape == x.shape, f"y.shape = {y.shape} != x.shape = {x.shape}"
-                x = 0.1*y + x
+                x_in = 0.1*y + x
                 if self.training:
-                    y = checkpoint(self.forward_pass, x, self.model[start_layer:end_layer], use_reentrant=False)
+                    y = checkpoint(self.forward_pass, x_in, self.model[start_layer:end_layer], use_reentrant=False)
                 else:
-                    y = self.forward_pass(x, self.model[start_layer:end_layer])
+                    y = self.forward_pass(x_in, self.model[start_layer:end_layer])
         
         # Last layer not included in fixed point iterations
         y = self.model[-1](y)
