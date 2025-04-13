@@ -338,6 +338,7 @@ class CustomRunner(dl.Runner):
             config_file=self.config_file,
             max_iter=self.max_iter,
             iter_every_n_layers=self.cfg.experiment.iter_every_n_layers,
+            alpha=self.cfg.experiment.alpha,
         )
         print(model)
         return model
