@@ -54,7 +54,12 @@ def construct_layer(dropout_p=0, bnorm=True, gelu=False, *args, **kwargs):
     if bnorm:
         # track_running_stats=False is needed to run the forward mode AD
         layers.append(
-            nn.BatchNorm3d(kwargs["out_channels"], track_running_stats=True)
+            # nn.BatchNorm3d(kwargs["out_channels"], track_running_stats=True)
+            nn.GroupNorm(
+                num_groups=kwargs["out_channels"],
+                num_channels=kwargs["out_channels"],
+                affine=False,
+            )
         )
     layers.append(nn.ELU(inplace=True) if gelu else nn.ReLU(inplace=True))
     if dropout_p > 0:
@@ -132,54 +137,97 @@ class enMesh_checkpoint(MeshNet):
             return self.eval_forward(x)
 
 
+# Fixed Point version (Corrected)
 class enMesh_fixedpoint(enMesh_checkpoint):
-    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10, iter_every_n_layers=None):
+    def __init__(self, in_channels, n_classes, channels, config_file, max_iter=10, iter_every_n_layers=None, alpha=0.9):
         super(enMesh_fixedpoint, self).__init__(in_channels, n_classes, channels, config_file)
         self.max_iter = max_iter
-        self.n_channels = channels
-        self.iter_every_n_layers = iter_every_n_layers or len(self.model) - 1
-        if self.iter_every_n_layers>=len(self.model):
-            raise ValueError(f"iter_every_n_layers must be less than the number of layers in the model; iter_every_n_layers = {self.iter_every_n_layers} >= {len(self.model)}")
+        self.n_channels = channels # Should match intermediate layers
+        self.num_layers_total = len(self.model)
+        self.iter_every_n_layers = iter_every_n_layers or (self.num_layers_total - 2) # Default: iterate all intermediate layers together
 
+        if self.iter_every_n_layers <= 0:
+             raise ValueError("iter_every_n_layers must be positive")
+        if self.iter_every_n_layers >= self.num_layers_total - 1:
+             # Warn or adjust? Iterating over just one layer block is valid.
+             # Let's adjust to iterate over all intermediate layers if value is too large.
+             print(f"Warning: iter_every_n_layers ({iter_every_n_layers}) >= num intermediate layers ({self.num_layers_total - 2}). Setting to iterate all intermediate layers together.")
+             self.iter_every_n_layers = self.num_layers_total - 2
 
-    def forward_pass(self, x, layers):
-        for layer in layers:
+        self.alpha = alpha # Damping factor for fixed point iteration
+
+    def iterate_block_of_layers(self, x_input, layers_module, n_iter):
+        """Applies layers_module iteratively with damping."""
+        x = x_input # Current state being iterated
+
+        for _ in range(n_iter):
+            # Apply the block of layers to the current state x
             if self.training:
-                x = checkpoint(layer, x, use_reentrant=False)
+                # Checkpoint the application of the *entire block* for this iteration step
+                y = checkpoint(layers_module, x, use_reentrant=False)
             else:
-                x = layer(x)
+                # No checkpointing needed during evaluation
+                y = layers_module(x)
+
+            # Update the state using damped fixed-point iteration:
+            # x_{k+1} = alpha * y_k + (1 - alpha) * x_k
+            # where y_k = layers_module(x_k)
+            x = self.alpha * y + (1.0 - self.alpha) * x
+
+        # Return the final stabilized state after n_iter iterations
         return x
+
     def fixed_point_iterations(self, x: torch.Tensor):
-        # First layer not included in fixed point iterations
-        x = self.model[0](x)
+        # --- 1. First layer ---
+        # Apply the first layer normally (no iteration)
+        if self.training:
+             # Checkpoint first layer individually if desired
+             x = checkpoint(self.model[0], x, use_reentrant=False)
+        else:
+            x = self.model[0](x)
 
-        n_layers = len(self.model)
-        y = torch.zeros(x.shape[0], self.n_channels, *x.shape[2:]).to(x.device)
-        for start_layer in range(1, n_layers-1, self.iter_every_n_layers):
-            end_layer = min(start_layer + self.iter_every_n_layers, n_layers-1)
+        if len(self.model) == 1:
+            return x
 
-            for _ in range(self.max_iter):
-                assert y.shape == x.shape, f"y.shape = {y.shape} != x.shape = {x.shape}"
-                x = 0.1*y + x
-                if self.training:
-                    y = checkpoint(self.forward_pass, x, self.model[start_layer:end_layer], use_reentrant=False)
-                else:
-                    y = self.forward_pass(x, self.model[start_layer:end_layer])
-        
-        # Last layer not included in fixed point iterations
-        y = self.model[-1](y)
+        # --- 2. Intermediate layers with fixed-point iteration ---
+        # Group intermediate layers into blocks
+        intermediate_layers = self.model[1:-1]
+        num_intermediate = len(intermediate_layers)
+
+        for i in range(0, num_intermediate, self.iter_every_n_layers):
+            start_idx = i
+            end_idx = min(i + self.iter_every_n_layers, num_intermediate)
+
+            # Indexing self.model directly: layer indices are start_idx+1 to end_idx
+            current_block_layers = self.model[start_idx+1 : end_idx+1] # Slice includes start, excludes end+1
+
+            # Apply fixed-point iteration to this block
+            x = self.iterate_block_of_layers(x, current_block_layers, self.max_iter)
+
+        # --- 3. Last layer ---
+        # Apply the last layer normally (no iteration)
+        if self.training:
+             y = checkpoint(self.model[-1], x, use_reentrant=False)
+        else:
+            y = self.model[-1](x)
+
         return y
 
     def train_forward(self, x: torch.Tensor):
-        x.requires_grad_()
         y = self.fixed_point_iterations(x)
         return y
-    
+
     def eval_forward(self, x: torch.Tensor):
-        self.model.eval()
-        with torch.inference_mode():
-            y = self.fixed_point_iterations(x)
+        y = self.fixed_point_iterations(x)
         return y
+
+    # Forward remains the same, dispatching to train/eval
+    def forward(self, x):
+        if self.training:
+            return self.train_forward(x)
+        else:
+            return self.eval_forward(x)
+
 
 def print_memory_stats(prefix=""):
     if torch.cuda.is_available():

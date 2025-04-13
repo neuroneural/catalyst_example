@@ -41,6 +41,7 @@ experiment:
   lr_scale: 0.01
   maxreps: 5
   iter_every_n_layers: 3 # When set to None, the number of layers-1 is used –– it runs fixed point iterations on all layers
+  alpha: 0.2 # Damping factor for fixed point iteration
   cubesizes_code: |
     [32, 64, 128, 192, 256]
   numcubes_code: |
