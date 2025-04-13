@@ -630,10 +630,11 @@ def main(cfg: DictConfig):
         )
         wandb_experiment = (
             f"{start_experiment + experiment:02} cube "
-            + str(subvolume_shape[0])
-            + " "
-            + collections[experiment]
-            + model_label
+            f"{subvolume_shape[0]} "
+            f"{collections[experiment]}"
+            f"-mx-it-{max_iters[experiment]}"
+            f"-it-ev-{cfg.experiment.iter_every_n_layers}"
+            f"-alpha-{cfg.experiment.alpha}"
         )
 
         # Set database parameters
