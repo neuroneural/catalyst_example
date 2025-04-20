@@ -34,7 +34,7 @@ utils.set_global_seed(SEED)
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:100"
 os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
-os.environ["NCCL_SOCKET_IFNAME"] = "ib0"
+# os.environ["NCCL_SOCKET_IFNAME"] = "ib0"
 # os.environ["NCCL_P2P_LEVEL"] = "NVL"
 
 torch_version = torch.__version__
@@ -628,14 +628,12 @@ def main(cfg: DictConfig):
             * numvolumes[experiment]
             / 256
         )
-        wandb_experiment = (
-            f"{start_experiment + experiment:02} cube "
-            f"{subvolume_shape[0]} "
-            f"{collections[experiment]} "
-            f"mx-it-{max_iters[experiment]} "
-            f"it-ev-{cfg.experiment.iter_every_n_layers} "
-            f"alpha-{cfg.experiment.alpha}"
-        )
+        wandb_experiment = f"""{start_experiment + experiment:02} cube \
+{subvolume_shape[0]} \
+{collections[experiment]} \
+mx-it-{max_iters[experiment]} \
+it-ev-{cfg.experiment.iter_every_n_layers} \
+alpha-{cfg.experiment.alpha}"""
 
         # Set database parameters
         client_creator.set_database(databases[experiment])
