@@ -114,7 +114,7 @@ class enMesh_checkpoint(MeshNet):
         y = x
         y.requires_grad_()
         y = checkpoint_sequential(
-            self.model, len(self.model), y, preserve_rng_state=False
+            self.model, len(self.model), y, preserve_rng_state=False, use_reentrant=False
         )
         return y
 
@@ -137,7 +137,7 @@ class enMesh_fixedpoint(enMesh_checkpoint):
         x.requires_grad_()
         for i in range(self.max_iter):
             y = checkpoint_sequential(
-                self.model, len(self.model), y, preserve_rng_state=False
+                self.model, len(self.model), y, preserve_rng_state=False, use_reentrant=False
             )
             # need to prepend on the channel dimension a tensor x with self.channels as number of channels + N for the y channels
             x = torch.cat([x, y], dim=1)

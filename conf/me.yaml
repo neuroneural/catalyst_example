@@ -1,6 +1,8 @@
-# an experiment with only 3 layers in meshnet 16,1,16
+# Same-stream MeshNet ensemble experiment.
+# Enables MeshNetME: multiple independent 5-channel MeshNets trained together
+# and executed sequentially so peak activation memory stays near one MeshNet.
 mongo:
-  host: "10.245.12.58" # "arctrdcn018.rs.gsu.edu"
+  host: "10.245.12.58"
   host_slurm: "arctrdcn018.rs.gsu.edu"
   dbname: "MindfulTensors"
   collection: "MRN"
@@ -10,51 +12,43 @@ mongo:
   validation_percent: 0.1
 
 wandb:
-  team: "hydra-meshnet"
-  project: "debug"
+  team: "neuroneural"
+  project: "synthGWM_5"
 
-bit16: False
+bit16: True
 
 model:
   n_classes: 3
-  model_channels: 11
-  model_label: "_11.32.16.1.gn"
+  model_channels: 5
+  model_label: "_me8x5_train4_eval1"
   config_file: "./modelAE.json"
   volume_shape: [256, 256, 256]
   maxshape: 300
   optimize_inline: False
-  use_groupnorm: True
-  use_me: False
+  use_groupnorm: False
+  use_me: True
   me:
-    num_experts: 4
+    num_experts: 8
     average_outputs: True
     train_experts: 4
-    eval_experts: 4
+    eval_experts: 1
+  me_weight_diversity_lambda: 1e-4
   loss_weight: [0, 1]
   use_refiner: False
-  refiner:
-    refiner_max_iter: 5
-    refiner_tol: 1e-4
-    refiner_anderson_m: 3
-    refiner_backward_mode: "implicit"
-    refiner_backward_max_iter: 10
-    refiner_backward_tol: 1e-5
-    refiner_backward_anderson_m: 3
-
 
 paths:
   loadcheckpoint: False
-  model: "./logs/tmp/synth3_11chn_32.16.1.gn/model.last.pth"
-  logdir: "./logs/tmp/synth3_11chn_32.16.1.gn/"
+  model: "./logs/tmp/synth3_me8x5_train4_eval1/model.last.pth"
+  logdir: "./logs/tmp/synth3_me8x5_train4_eval1/"
 
 client_creator:
   crop_tensor: False
 
 experiment:
-  lr_scale: 1
+  lr_scale: 0.0001
   maxreps: 10
   cubesizes_code: |
-    [256] * maxreps
+    [192] + [256] * (maxreps - 1)
   numcubes_code: |
     [1] * maxreps
   numvolumes_code: |
@@ -64,11 +58,11 @@ experiment:
   databases_code: |
     ["MindfulTensors"] * maxreps
   collections_code: |
-    ["HCPnew"] * maxreps
+    ["MRN"] * maxreps
   dbfields_code: |
     [("T1", "label3")] * maxreps
   epochs_code: |
-    [10] * (maxreps-2) + [50, 100]
+    [2] + [5] * (maxreps-3) + [50, 100]
   prefetches_code: |
     [24] * maxreps
   attenuates_code: |

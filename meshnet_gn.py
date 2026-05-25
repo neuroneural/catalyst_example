@@ -388,7 +388,7 @@ class CheckpointMixin:
         y = x
         y.requires_grad_()
         y = checkpoint_sequential(
-            self.model, len(self.model), y, preserve_rng_state=False
+            self.model, len(self.model), y, preserve_rng_state=False, use_reentrant=False
         )
         return y
 
