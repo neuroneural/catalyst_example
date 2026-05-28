@@ -338,6 +338,155 @@ class enMesh(MeshNet):
 
         return lss_value, y_hat
 
+
+class ChannelSEBlock3D(nn.Module):
+    """Squeeze-and-Excitation block for 3D feature maps.
+
+    Ref: Hu et al., "Squeeze-and-Excitation Networks", CVPR 2018.
+
+    Adds channel-wise attention whose parameters live entirely in
+    Linear layers operating on [B, hidden] vectors.  No additional
+    feature maps of full spatial size are ever allocated, so peak
+    GPU memory stays identical to the base convolution.
+
+    The excitation MLP can be made arbitrarily wide (`hidden_channels`)
+    and deep (`num_fc_layers`) to pack more learnable capacity without
+    any spatial-memory cost.
+
+    Args:
+        channels: number of input/output channels (C).
+        hidden_channels: explicit width of every hidden FC layer.
+            When set, `reduction` and `min_channels` are ignored.
+            Use this to decouple SE capacity from C.
+        reduction: reduction ratio applied to C (default: 4).
+            Only used when `hidden_channels` is None.
+        min_channels: floor on bottleneck width when using
+            `reduction` (default: 4).
+        num_fc_layers: total number of Linear layers in the
+            excitation path (default: 2, i.e. classic SE).
+            Values > 2 insert extra hidden→hidden layers.
+    """
+
+    def __init__(self, channels, hidden_channels=None, reduction=4,
+                 min_channels=4, num_fc_layers=2):
+        super().__init__()
+        if hidden_channels is not None:
+            bottleneck = hidden_channels
+        else:
+            bottleneck = max(channels // reduction, min_channels)
+
+        self.squeeze = nn.AdaptiveAvgPool3d(1)
+
+        # Build excitation MLP: in→hidden [→hidden …] →out→σ
+        layers = []
+        in_feat = channels
+        for _ in range(num_fc_layers - 1):
+            layers.append(nn.Linear(in_feat, bottleneck, bias=False))
+            layers.append(nn.ReLU(inplace=True))
+            in_feat = bottleneck
+        layers.append(nn.Linear(in_feat, channels, bias=False))
+        layers.append(nn.Sigmoid())
+        self.excitation = nn.Sequential(*layers)
+
+    def forward(self, x):
+        b, c = x.shape[:2]
+        # Squeeze: global average pool over (D, H, W) → [B, C]
+        scale = self.squeeze(x).view(b, c)
+        # Excitation: MLP → [B, C]
+        scale = self.excitation(scale)
+        # Scale: broadcast-multiply back onto spatial feature map
+        return x * scale.view(b, c, 1, 1, 1)
+
+
+def _inject_se_blocks(model, se_hidden_channels=None, se_reduction=4,
+                      se_min_channels=4, se_num_fc_layers=2):
+    """Inject SE blocks after each Conv+BN+ReLU sequential layer.
+
+    Leaves bare Conv3d layers (e.g. the final 1×1 output conv) untouched.
+    """
+    new_layers = []
+    for layer in model:
+        if isinstance(layer, nn.Sequential):
+            out_ch = layer[0].out_channels
+            se = ChannelSEBlock3D(
+                out_ch,
+                hidden_channels=se_hidden_channels,
+                reduction=se_reduction,
+                min_channels=se_min_channels,
+                num_fc_layers=se_num_fc_layers,
+            )
+            layer = nn.Sequential(*list(layer.children()), se)
+        new_layers.append(layer)
+    return nn.Sequential(*new_layers)
+
+
+class enMesh_checkpoint_SE(enMesh_checkpoint):
+    """MeshNet with Squeeze-and-Excitation channel attention.
+
+    Inherits checkpoint-sequential training from enMesh_checkpoint.
+    SE blocks are appended after each Conv+BN+ReLU block (every layer
+    except the final 1×1 classification conv).
+
+    Memory overhead: none beyond base MeshNet — SE operates on [B, C]
+    and [B, hidden] vectors only.  Peak spatial activation memory is
+    identical to a single MeshNet layer.
+
+    Parameter budget is controlled independently of memory via:
+      - hidden_channels: width of the excitation MLP (can be >> C)
+      - num_fc_layers:   depth of the excitation MLP (≥ 2)
+
+    Example parameter counts (9 SE blocks):
+      C=5,  hidden=64, layers=2:   9 × 2×5×64       =  5,760
+      C=5,  hidden=64, layers=3:   9 × (5×64+64²+64×5) = 42,624
+      C=21, hidden=64, layers=2:   9 × 2×21×64      = 24,192
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        n_classes,
+        channels,
+        config_file,
+        se_hidden_channels=None,
+        se_reduction=4,
+        se_min_channels=4,
+        se_num_fc_layers=2,
+    ):
+        super().__init__(in_channels, n_classes, channels, config_file)
+        self.model = _inject_se_blocks(
+            self.model, se_hidden_channels, se_reduction,
+            se_min_channels, se_num_fc_layers,
+        )
+
+
+class enMesh_SE(enMesh):
+    """MeshNet-SE with manual layer-by-layer backprop for large volumes.
+
+    Inherits the memory-minimal manual backprop from enMesh.
+    SE blocks are injected identically to enMesh_checkpoint_SE.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        n_classes,
+        channels,
+        config_file,
+        optimize_inline=False,
+        se_hidden_channels=None,
+        se_reduction=4,
+        se_min_channels=4,
+        se_num_fc_layers=2,
+    ):
+        super().__init__(
+            in_channels, n_classes, channels, config_file, optimize_inline
+        )
+        self.model = _inject_se_blocks(
+            self.model, se_hidden_channels, se_reduction,
+            se_min_channels, se_num_fc_layers,
+        )
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

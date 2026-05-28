@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
 from dice import faster_dice, DiceLoss
-from meshnet import enMesh_checkpoint, enMesh
+from meshnet import enMesh_checkpoint, enMesh, enMesh_checkpoint_SE, enMesh_SE
 from meshnet_gn import enMesh_checkpoint as enMesh_checkpoint_gn
 from meshnetme import MeshNetME_checkpoint
 from refiner import enDynamicMesh_checkpoint, enDynamicMesh
@@ -186,6 +186,8 @@ class CustomRunner(dl.Runner):
         refiner_base_loss_lambda=0.0,
         me_kwargs=None,
         me_weight_diversity_lambda=0.0,
+        use_se=False,
+        se_kwargs=None,
     ):
         super().__init__()
         self._logdir = logdir
@@ -229,6 +231,8 @@ class CustomRunner(dl.Runner):
         self.refiner_base_loss_lambda = refiner_base_loss_lambda
         self.me_kwargs = me_kwargs or {}
         self.me_weight_diversity_lambda = me_weight_diversity_lambda
+        self.use_se = use_se
+        self.se_kwargs = se_kwargs or {}
         self._local_epoch_index = 0
         self._refiner_frozen = False
 
@@ -495,25 +499,42 @@ class CustomRunner(dl.Runner):
         else:
             if self.meshnetme:
                 modelClass = MeshNetME_checkpoint
+            elif self.use_se:
+                modelClass = enMesh_checkpoint_SE
             else:
                 modelClass = (
                     enMesh_checkpoint_gn if self.groupnorm else enMesh_checkpoint
                 )
             if self.shape > self.maxshape:
-                model = enMesh(
-                    in_channels=1,
-                    n_classes=self.n_classes,
-                    channels=self.n_channels,
-                    config_file=self.config_file,
-                    optimize_inline=self.optimize_inline,
-                )
+                if self.use_se:
+                    model = enMesh_SE(
+                        in_channels=1,
+                        n_classes=self.n_classes,
+                        channels=self.n_channels,
+                        config_file=self.config_file,
+                        optimize_inline=self.optimize_inline,
+                        **self.se_kwargs,
+                    )
+                else:
+                    model = enMesh(
+                        in_channels=1,
+                        n_classes=self.n_classes,
+                        channels=self.n_channels,
+                        config_file=self.config_file,
+                        optimize_inline=self.optimize_inline,
+                    )
             else:
+                extra_kwargs = (
+                    self.se_kwargs if self.use_se
+                    else self.me_kwargs if self.meshnetme
+                    else {}
+                )
                 model = modelClass(
                     in_channels=1,
                     n_classes=self.n_classes,
                     channels=self.n_channels,
                     config_file=self.config_file,
-                    **(self.me_kwargs if self.meshnetme else {}),
+                    **extra_kwargs,
                 )
         return model
 
@@ -946,6 +967,9 @@ def main(cfg: DictConfig):
     model_label = cfg.model.model_label
     use_groupnorm = cfg.model.use_groupnorm
     use_refiner = cfg.model.get("use_refiner", False)
+    use_se = cfg.model.get("use_se", False)
+    se_cfg = cfg.model.get("se", {})
+    se_kwargs = OmegaConf.to_container(se_cfg, resolve=True) if se_cfg else {}
     me_cfg = cfg.model.get("me", {})
     me_kwargs = OmegaConf.to_container(me_cfg, resolve=True) if me_cfg else {}
     refiner_cfg = cfg.model.get("refiner", {})
@@ -1076,6 +1100,8 @@ def main(cfg: DictConfig):
             refiner_base_loss_lambda=refiner_base_loss_lambda,
             me_kwargs=me_kwargs,
             me_weight_diversity_lambda=me_weight_diversity_lambda,
+            use_se=use_se,
+            se_kwargs=se_kwargs,
         )
         runner.run()
 
