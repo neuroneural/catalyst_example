@@ -161,3 +161,10 @@ cython_debug/
 
 # Antigravity agent files
 .antigravitycli/
+
+# Training run artifacts / large binaries (keep the repo pull-clean)
+.DS_Store
+logs/
+nifti_predictions/
+*.pth
+*.svgz

@@ -111,6 +111,8 @@ class MeshNet(nn.Module):
 # a single layer worth of GPU memory
 class enMesh_checkpoint(MeshNet):
     def train_forward(self, x):
+        if not getattr(self, "use_checkpoint", True):
+            return self.model(x)
         y = x
         y.requires_grad_()
         y = checkpoint_sequential(
@@ -381,12 +383,16 @@ class ChannelSEBlock3D(nn.Module):
         layers = []
         in_feat = channels
         for _ in range(num_fc_layers - 1):
-            layers.append(nn.Linear(in_feat, bottleneck, bias=False))
+            layers.append(nn.Linear(in_feat, bottleneck, bias=True))
             layers.append(nn.ReLU(inplace=True))
             in_feat = bottleneck
-        layers.append(nn.Linear(in_feat, channels, bias=False))
+        layers.append(nn.Linear(in_feat, channels, bias=True))
         layers.append(nn.Sigmoid())
         self.excitation = nn.Sequential(*layers)
+        
+        # Initialize final layer to 0 so the block acts as an identity at first
+        nn.init.zeros_(self.excitation[-2].weight)
+        nn.init.zeros_(self.excitation[-2].bias)
 
     def forward(self, x):
         b, c = x.shape[:2]
@@ -394,8 +400,8 @@ class ChannelSEBlock3D(nn.Module):
         scale = self.squeeze(x).view(b, c)
         # Excitation: MLP → [B, C]
         scale = self.excitation(scale)
-        # Scale: broadcast-multiply back onto spatial feature map
-        return x * scale.view(b, c, 1, 1, 1)
+        # Scale: broadcast-multiply back onto spatial feature map (x2 to preserve variance)
+        return x * scale.view(b, c, 1, 1, 1) * 2.0
 
 
 def _inject_se_blocks(model, se_hidden_channels=None, se_reduction=4,

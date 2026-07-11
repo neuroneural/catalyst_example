@@ -1,6 +1,34 @@
 # catalyst_example
 an example of the training file supporting distributed training and curriculum learning with Catalyst
 
+# Fast training of `modelAE_hdc_deep.json`
+
+To reproduce the fast, from-scratch training of the model, use the throughput-optimized
+entrypoint with the `gn_hdc_deep` config (it is that entrypoint's default config):
+
+```bash
+source ~/venv/torch/bin/activate
+python curriculum_training_fast.py --config-name gn_hdc_deep --config-dir conf
+```
+
+`curriculum_training_fast.py` reuses all of `curriculum_training.py`'s logic and layers
+GPU-efficiency features on top (cuDNN autotuning, TF32, `channels_last_3d`, `torch.compile`
+applied after the DDP wrap). `conf/gn_hdc_deep.yaml` supplies the convergence knobs that
+matter for this model: gradient accumulation with a larger effective batch (memory-neutral),
+bf16 autocast (no GradScaler stalls), a single long OneCycle schedule with a short warmup,
+and gradient clipping + decoupled weight decay for a robust, fp16-safe run from random init.
+It points `model.config_file` at `./modelAE_hdc_deep.json`.
+
+Before the first run, set `wandb.team`/`wandb.project` and point the `mongo` +
+`experiment` db/collection/labelfield at your own data source (the values in the config
+are examples).
+
+**Opt-in experiments (disabled by default — do not enable as defaults):** the config has
+`model.jdx` (channel-decorrelation, `jdx.py`) and `model.distill` (teacher distillation,
+`distill.py`) blocks, both `enabled: false`. Whether they improve robustness is not yet
+established; flip `enabled: true` to try them.
+
+
 # Installation
 
 1. Create and populate the environment

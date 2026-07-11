@@ -1,22 +1,27 @@
 import hydra
 from omegaconf import DictConfig, OmegaConf, ListConfig
 import os
+import math
 import random
 import shutil
 from packaging import version
 import yaml
 from catalyst import dl, metrics, utils
 from catalyst.data import BatchPrefetchLoaderWrapper
+from catalyst.utils import load_checkpoint
 
+import numpy as np
 import torch
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
-from dice import faster_dice, DiceLoss
+from dice import faster_dice, DiceLoss, CEDiceLoss
 from meshnet import enMesh_checkpoint, enMesh, enMesh_checkpoint_SE, enMesh_SE
-from meshnet_gn import enMesh_checkpoint as enMesh_checkpoint_gn
+from meshnet_gn import enMesh_checkpoint as enMesh_checkpoint_gn, SpatialAEMeshNet
 from meshnetme import MeshNetME_checkpoint
 from refiner import enDynamicMesh_checkpoint, enDynamicMesh
+from distill import Distiller
+from jdx import jdx_penalty
 from mindfultensors.gencoords import CoordsGenerator
 from mindfultensors.utils import unit_interval_normalize, DBBatchSampler
 
@@ -32,44 +37,128 @@ from mindfultensors.mongoloader import (
 
 REFINER_CLASS_NAMES = {"KernelRefiner", "OneShotKernelRefiner", "BasisKernelAdapter"}
 
+
+class EpochShuffleBatchSampler(DBBatchSampler):
+    """DBBatchSampler that reshuffles the order every epoch.
+
+    The stock DBBatchSampler re-seeds NumPy with the SAME fixed ``seed`` on every
+    ``__iter__`` call, so it yields the identical permutation each epoch -> the
+    batch order is frozen for the whole run (visible as periodic, epoch-aligned
+    artifacts in the training loss). Here we offset the seed by an epoch counter
+    so each epoch gets a different but fully reproducible permutation.
+
+    The sampler lives in the main process (workers receive indices, not the
+    sampler), so the counter advances correctly even with persistent_workers.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._epoch = 0
+
+    def __iter__(self):
+        base = 0 if self.seed is None else int(self.seed)
+        np.random.seed((base + self._epoch) % (2**32))
+        self._epoch += 1
+        return self.__chunks__(
+            np.random.permutation(self.data_size), self.batch_size
+        )
+
+
+def _strip_compile_prefix(state_dict):
+    """Strip the ``_orig_mod.`` prefix that ``torch.compile`` adds to state-dict
+    keys, so checkpoints are portable between compiled and non-compiled models.
+
+    If no keys carry the prefix the dict is returned unchanged (zero-copy).
+    """
+    prefix = "_orig_mod."
+    if not any(k.startswith(prefix) for k in state_dict):
+        return state_dict
+    return {k.removeprefix(prefix): v for k, v in state_dict.items()}
+
+
+class CompileSafeCheckpointCallback(dl.CheckpointCallback):
+    """Drop-in replacement for ``dl.CheckpointCallback`` that normalises
+    ``_orig_mod.`` key prefixes on every save **and** every load so that
+    checkpoints work regardless of whether ``torch.compile`` was active at
+    save time, load time, both, or neither."""
+
+    # -- load path ----------------------------------------------------------
+    def _load(self, runner, resume_logpath=None, resume_model=None,
+              resume_runner=None):
+        # Sanitise the on-disk checkpoint *before* the parent class calls
+        # load_state_dict, so the keys always match the raw model.
+        for path in (resume_logpath, resume_model):
+            if path is not None and os.path.isfile(path):
+                sd = load_checkpoint(path)
+                clean = _strip_compile_prefix(sd)
+                if clean is not sd:  # keys were rewritten
+                    torch.save(clean, path)
+                    print(f"[ckpt] stripped _orig_mod. prefix from {path}",
+                          file=sys.stderr, flush=True)
+
+        # Two-head resume: the live model is a TwoHeadMeshNet (base.model.* +
+        # head_aux.*) but the on-disk checkpoint is single-head (model.*). The
+        # parent's strict load_state_dict would fail on the key mismatch. Load
+        # the base ourselves, non-strict (leaving the fresh 18-class aux head
+        # untouched), and take the model out of the parent's hands. A genuine
+        # two-head checkpoint (already base.*/head_aux.*) is loaded verbatim.
+        from two_head import TwoHeadMeshNet
+        unwrapped = runner.engine.unwrap_model(runner.model)
+        while hasattr(unwrapped, "_orig_mod"):
+            unwrapped = unwrapped._orig_mod
+        if isinstance(unwrapped, TwoHeadMeshNet) and resume_model and os.path.isfile(resume_model):
+            sd = _strip_compile_prefix(load_checkpoint(resume_model))
+            remapped = {}
+            for k, v in sd.items():
+                if k.startswith("base.") or k.startswith("head_aux."):
+                    remapped[k] = v                 # already a two-head ckpt
+                else:
+                    remapped["base." + k] = v        # single-head -> base.*
+            missing, unexpected = unwrapped.load_state_dict(remapped, strict=False)
+            aux_missing = [m for m in missing if m.startswith("head_aux.")]
+            base_missing = [m for m in missing if not m.startswith("head_aux.")]
+            print(f"[two_head/_load] resumed base from {resume_model}: "
+                  f"{len(base_missing)} base-missing (want 0), "
+                  f"{len(aux_missing)} aux-fresh (want 2), "
+                  f"{len(unexpected)} unexpected", file=sys.stderr, flush=True)
+            resume_model = None  # prevent the parent from strict-loading again
+
+        super()._load(
+            runner,
+            resume_logpath=resume_logpath,
+            resume_model=resume_model,
+            resume_runner=resume_runner,
+        )
+
+    # -- save path ----------------------------------------------------------
+    def _save(self, runner, obj, logprefix):
+        # For "model" mode, unwrap any OptimizedModule so state_dict() never
+        # contains the _orig_mod. prefix in the first place.
+        if self.mode == "model" and isinstance(obj, torch.nn.Module):
+            unwrapped = runner.engine.unwrap_model(obj)
+            # torch.compile wraps in torch._dynamo.OptimizedModule which
+            # stores the real model in ._orig_mod.
+            while hasattr(unwrapped, "_orig_mod"):
+                unwrapped = unwrapped._orig_mod
+            # Temporarily replace the runner's model so the parent's _save
+            # sees the fully-unwrapped module.
+            return super()._save(runner, unwrapped, logprefix)
+        return super()._save(runner, obj, logprefix)
+
+
 import sys
+import gc
 import time
 from pymongo.errors import OperationFailure
 
-# Monkey-patching MongoDataset and MongoheadDataset to be robust against transient socket/EOF errors
-def make_safe_getitem(original_getitem, class_name):
-    def safe_getitem(self, batch, *args, **kwargs):
-        max_retries = 10
-        last_exception = None
-        for attempt in range(max_retries):
-            try:
-                return original_getitem(self, batch, *args, **kwargs)
-            except (EOFError, OperationFailure, RuntimeError, Exception) as e:
-                last_exception = e
-                print(
-                    f"\n[Warning] {class_name}.__getitem__ failed (attempt {attempt + 1}/{max_retries}): {e}. "
-                    f"Closing MongoClient to force reconnection...",
-                    file=sys.stderr,
-                    flush=True
-                )
-                
-                # Close the MongoClient connection
-                try:
-                    if hasattr(self, "collection") and isinstance(self.collection, dict) and "bin" in self.collection:
-                        client = self.collection["bin"].database.client
-                        client.close()
-                        print(f"[Info] MongoClient closed successfully.", file=sys.stderr, flush=True)
-                except Exception as close_err:
-                    print(f"[Warning] Failed to close MongoClient: {close_err}", file=sys.stderr, flush=True)
-                
-                time.sleep(1)
-        
-        raise last_exception
-    return safe_getitem
-
-# Apply monkey-patches to resolve fork-safety connection issues
-MongoDataset.__getitem__ = make_safe_getitem(MongoDataset.__getitem__, "MongoDataset")
-MongoheadDataset.__getitem__ = lambda self, batch, *args, **kwargs: MongoDataset.__getitem__(self, batch, *args, **kwargs)
+# NOTE: no __getitem__ monkey-patching. Both train and validation use
+# MongoheadDataset, whose native __getitem__ is wrapped in the library's
+# @retry_on_eof_error (10 retries, 1s sleep, on EOFError/OperationFailure/
+# RuntimeError) -- which is exactly the wirehead-swap protection we need:
+# it retries the query on the SAME open client until the dropped-and-recreated
+# collection reappears. The previous patch reimplemented this AND closed the
+# client on error, which turned recoverable swaps into "Cannot use MongoClient
+# after close" crashes.
 
 
 SEED = random.randint(0, 9999)
@@ -168,12 +257,23 @@ class CustomRunner(dl.Runner):
         wandb_team: str,
         db_fields: tuple,
         groupnorm=False,
+        affine=False,
         prefetches=8,
+        num_workers=4,
+        persistent_workers=False,
+        prefetch_factor=4,
+        valid_prefetch_factor=2,
+        dice_every_n_steps=1,
+        ddp_batch_sync=True,
+        dice_subsample_stride=4,
         volume_shape=[256] * 3,
         subvolume_shape=[256] * 3,
         lowprecision=False,
         meshnetme=False,
         lossweight=[1, 0],
+        label_smoothing=0.01,
+        dice_generalized=False,
+        loss_fused=False,
         maxshape=300,
         hparams=None,
         use_refiner=False,
@@ -188,6 +288,21 @@ class CustomRunner(dl.Runner):
         me_weight_diversity_lambda=0.0,
         use_se=False,
         se_kwargs=None,
+        use_checkpoint=True,
+        weight_decay=0.0,
+        grad_clip=0.0,
+        accum_steps=1,
+        amp_dtype="float16",
+        use_ema=False,
+        ema_decay=0.999,
+        use_spatial_ae=False,
+        spatial_ae_mult=2,
+        spatial_ae_down="avgpool",
+        spatial_ae_up="transposed",
+        sched_pct_start=0.1,
+        sched_div_factor=100.0,
+        sched_final_div=1e4,
+        jdx_kwargs=None,
     ):
         super().__init__()
         self._logdir = logdir
@@ -201,6 +316,19 @@ class CustomRunner(dl.Runner):
         self.onecycle_lr = onecycle_lr
         self.rmsprop_lr = rmsprop_lr
         self.prefetches = prefetches
+        self.num_workers = num_workers
+        # persistent_workers=True avoids per-epoch worker respawn but makes workers
+        # long-lived, so glibc malloc retention/fragmentation from the ~67MB buffer
+        # churn (b"".join + lz4 + torch.load in the mindfultensors path) accumulates
+        # as host-RAM creep -> OOM (seen ~epoch 27). Safe to set True ONLY with the
+        # allocator tamed at launch: MALLOC_TRIM_THRESHOLD_=0 MALLOC_ARENA_MAX=2, or
+        # LD_PRELOAD jemalloc/tcmalloc. Default False = respawn each epoch (bounded).
+        self.persistent_workers = bool(persistent_workers)
+        self.prefetch_factor = prefetch_factor
+        self.valid_prefetch_factor = valid_prefetch_factor
+        self.dice_every_n_steps = dice_every_n_steps
+        self.ddp_batch_sync = ddp_batch_sync
+        self.dice_subsample_stride = dice_subsample_stride
         self.db_host = db_host
         self.db_name = db_name
         self.db_collection = db_collection
@@ -216,7 +344,11 @@ class CustomRunner(dl.Runner):
         self.bit16 = lowprecision
         self.index_id = indexid
         self.groupnorm = groupnorm
+        self.affine = affine
         self.loss_weight = lossweight
+        self.label_smoothing = label_smoothing
+        self.dice_generalized = dice_generalized
+        self.loss_fused = loss_fused
         self.meshnetme = meshnetme
         self.wandb_team = wandb_team
         self.maxshape = maxshape
@@ -233,8 +365,70 @@ class CustomRunner(dl.Runner):
         self.me_weight_diversity_lambda = me_weight_diversity_lambda
         self.use_se = use_se
         self.se_kwargs = se_kwargs or {}
+        self.use_checkpoint = use_checkpoint
+        # Decoupled L2 (AdamW) on conv weights only. 0.0 => old behavior (plain
+        # Adam, no decay). Norm/bias params are always excluded; see
+        # get_optimizer. Keeps conv-weight/activation magnitudes down so the
+        # exported model stays fp16-safe.
+        self.weight_decay = float(weight_decay)
+        # Clip total grad norm before the optimizer step (caps outlier-batch
+        # gradients -> stops the transient train-dice collapses). 0.0 = off.
+        self.grad_clip = float(grad_clip)
+        # --- convergence-speed + EMA + spatial-AE knobs (default = old behavior) ---
+        self.accum_steps = max(1, int(accum_steps))
+        self.amp_dtype = amp_dtype
+        self.use_ema = bool(use_ema)
+        self.ema_decay = float(ema_decay)
+        self.use_spatial_ae = bool(use_spatial_ae)
+        self.spatial_ae_mult = int(spatial_ae_mult)
+        self.spatial_ae_down = spatial_ae_down
+        self.spatial_ae_up = spatial_ae_up
+        self.sched_pct_start = float(sched_pct_start)
+        self.sched_div_factor = float(sched_div_factor)
+        self.sched_final_div = float(sched_final_div)
+        self._ema_shadow = None
+        self._ema_backup = None
+        self._accum_count = 0
         self._local_epoch_index = 0
         self._refiner_frozen = False
+
+        # --- JDX / JDRX channel-decorrelation pressure (default: OFF) ----------
+        # Auxiliary per-layer loss that pushes feature channels to encode
+        # DIFFERENT sources (minimize off-diagonal channel covariance on
+        # structured sub-batches; see jdx.py + JDX.pdf eq. 3). Training-only:
+        # never touches inference / the WebGPU export, and adds no peak memory
+        # (activations already live in the graph with use_checkpoint=false).
+        _jdx = jdx_kwargs or {}
+        self.jdx_enabled = bool(_jdx.get("enabled", False))
+        self.jdx_lambda = float(_jdx.get("lambda", 0.0))
+        self.jdx_num_batches = int(_jdx.get("num_batches", 4))
+        # subcube: int (uniform) OR list (per hooked layer; e.g. larger middle).
+        _sub = _jdx.get("subcube", 9)
+        self.jdx_subcube = list(_sub) if isinstance(_sub, (list, tuple, ListConfig)) \
+            else int(_sub)
+        # Restrict subcube sampling to the brain bounding box (from the label),
+        # so covariances are estimated on tissue, not uninformative background.
+        self.jdx_foreground = bool(_jdx.get("foreground", True))
+        # "corr" (recommended): variance-normalized off-diagonal correlation
+        # (Barlow-style; cannot be gamed by inflating channel variance).
+        # "ratio": raw JDX off/diag covariance energy ratio (eq. 3, legacy).
+        self.jdx_mode = str(_jdx.get("mode", "ratio"))
+        # randomize_jdx: False => JDX (structured contiguous subcubes, the
+        # promising spatial regime). True => JDRX (global i.i.d. voxel sampling).
+        self.jdx_randomize = bool(_jdx.get("randomize_jdx", False))
+        # Exclude the last N HIDDEN layers from the penalty. The penultimate
+        # feature layers compress toward the task's class count (~3/18), so a
+        # low channel rank there is appropriate, not waste -- pressuring them
+        # fights the task loss (the diagnostic shows layer 12 resists it). The
+        # reclaimable redundancy is in the early/middle layers. 0 = all layers.
+        self.jdx_skip_last = int(_jdx.get("skip_last_layers", 0))
+        self.jdx_warmup_steps = int(_jdx.get("warmup_steps", 0))
+        self._jdx_acts = []
+        self._jdx_handles = []
+        self._jdx_hooked = False
+        self._jdx_step = 0
+        self._jdx_region = None
+        self._last_jdx = None
 
     def set_refiner_blend(self, blend):
         if not getattr(self, "use_refiner", False) or not hasattr(self, "model"):
@@ -341,6 +535,108 @@ class CustomRunner(dl.Runner):
             return torch.zeros((), device=device)
         return model.weight_diversity_loss()
 
+    def _register_jdx_hooks(self, model):
+        """Attach forward hooks that capture each hidden trunk activation for the
+        JDX penalty. No-op unless jdx.enabled. Hooks fire only in training and
+        only when JDX is active; captured tensors are read (never mutated)."""
+        if not self.jdx_enabled or self._jdx_hooked:
+            return
+        import torch.nn as nn
+        # Unwrap the two-head wrapper (if any) to reach the plain trunk Sequential
+        # that ends in the deployment head Conv3d.
+        base = getattr(model, "base", model)
+        trunk = getattr(base, "model", None)
+        if trunk is None or len(trunk) == 0:
+            print("[jdx] WARNING: could not find trunk Sequential; JDX disabled",
+                  file=sys.stderr, flush=True)
+            self._jdx_hooked = True
+            return
+        n_hooked = 0
+        layers = list(trunk)
+        # Hook hidden layers [0, cutoff); cutoff excludes the head (last module)
+        # plus the last jdx_skip_last hidden layers.
+        cutoff = len(layers) - 1 - max(0, self.jdx_skip_last)
+        for li, layer in enumerate(layers):
+            if li >= cutoff:
+                continue  # skip the head and the last jdx_skip_last hidden layers
+            act_mod = None
+            for m in layer.modules():
+                if isinstance(m, (nn.GELU, nn.ReLU, nn.ELU)):
+                    act_mod = m  # last activation in the block == its output act
+            if act_mod is not None:
+                self._jdx_handles.append(
+                    act_mod.register_forward_hook(self._jdx_hook))
+                n_hooked += 1
+        self._jdx_hooked = True
+        print(f"[jdx] enabled: hooked {n_hooked} activation layers "
+              f"(sampling={'JDRX' if self.jdx_randomize else 'JDX'}, "
+              f"objective={self.jdx_mode}, lambda={self.jdx_lambda}, "
+              f"L={self.jdx_num_batches}, subcube={self.jdx_subcube}, "
+              f"foreground={self.jdx_foreground}, skip_last={self.jdx_skip_last}, "
+              f"warmup={self.jdx_warmup_steps})",
+              file=sys.stderr, flush=True)
+
+    def _jdx_hook(self, module, inputs, output):
+        # Capture only during a training forward while JDX is active. The list is
+        # cleared each step in get_jdx_penalty after it is consumed.
+        if self.jdx_enabled and getattr(self, "model", None) is not None \
+                and self.model.training:
+            self._jdx_acts.append(output)
+
+    def _jdx_foreground_region(self, label):
+        """Brain bounding box (z0,z1,y0,y1,x0,x1) from the label (foreground =
+        non-background class), unioned over the batch. Returns None if the label
+        shape is unexpected or empty. MeshNet keeps every layer at input
+        resolution, so this one box applies to all hooked activations."""
+        try:
+            with torch.no_grad():
+                fg = label > 0
+                while fg.dim() > 4:      # drop channel dim if present: [N,1,D,H,W]
+                    fg = fg.any(1)
+                if fg.dim() == 4:
+                    fg = fg.any(0)       # union over batch -> [D,H,W]
+                if fg.dim() != 3 or not bool(fg.any()):
+                    return None
+                zz = torch.where(fg.any(2).any(1))[0]
+                yy = torch.where(fg.any(2).any(0))[0]
+                xx = torch.where(fg.any(1).any(0))[0]
+                return (int(zz[0]), int(zz[-1]) + 1,
+                        int(yy[0]), int(yy[-1]) + 1,
+                        int(xx[0]), int(xx[-1]) + 1)
+        except Exception:
+            return None
+
+    def _jdx_weight_now(self):
+        if self.jdx_warmup_steps <= 0:
+            return self.jdx_lambda
+        frac = min(1.0, self._jdx_step / float(self.jdx_warmup_steps))
+        return self.jdx_lambda * frac
+
+    def get_jdx_penalty(self, device):
+        """Consume the activations captured this step and return the (unweighted)
+        mean JDX energy ratio. Clears the capture buffer. Returns 0 if JDX is off
+        or nothing was captured."""
+        acts = self._jdx_acts
+        self._jdx_acts = []
+        if not self.jdx_enabled or not acts:
+            return torch.zeros((), device=device)
+        # Compute in fp32 with autocast disabled: this runs inside the bf16/fp16
+        # autocast region, and a bf16 covariance would be too coarse for a
+        # meaningful off/diag energy ratio.
+        dev_type = "cuda" if (hasattr(device, "type") and device.type == "cuda") \
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        with torch.autocast(device_type=dev_type, enabled=False):
+            pen = jdx_penalty(
+                acts,
+                num_batches=self.jdx_num_batches,
+                subcube=self.jdx_subcube,
+                randomize=self.jdx_randomize,
+                mode=self.jdx_mode,
+                region=getattr(self, "_jdx_region", None),
+            )
+        self._last_jdx = pen.detach()
+        return pen.to(device)
+
     def get_engine(self):
         if torch.cuda.device_count() > 1:
             return dl.DistributedDataParallelEngine(
@@ -422,12 +718,50 @@ class CustomRunner(dl.Runner):
             id=self.index_id,
         )
 
+        # Reshuffle the training order every epoch (stock DBBatchSampler freezes
+        # it). seed=SEED under DDP keeps it reproducible; the per-epoch offset
+        # lives inside EpochShuffleBatchSampler.
         tsampler = (
-            DBBatchSampler(tdataset, batch_size=self.num_volumes, seed=SEED)
+            EpochShuffleBatchSampler(tdataset, batch_size=self.num_volumes, seed=SEED)
             if self.engine.is_ddp
-            else DBBatchSampler(tdataset, batch_size=self.num_volumes)
+            else EpochShuffleBatchSampler(tdataset, batch_size=self.num_volumes)
         )
 
+        # One-time per process: confirm each DDP rank shuffles differently (i.e.
+        # ranks see diverse data, not redundant copies). Read-only: uses a LOCAL
+        # RandomState so it does NOT touch global RNG or the sampler's state.
+        if not getattr(self, "_logged_sampler_diversity", False):
+            try:
+                import torch.distributed as dist
+                rank = (
+                    dist.get_rank()
+                    if (dist.is_available() and dist.is_initialized())
+                    else 0
+                )
+                seed_val = SEED if self.engine.is_ddp else None
+                preview = (
+                    np.random.RandomState(int(seed_val))
+                    .permutation(len(tdataset))[:6].tolist()
+                    if seed_val is not None else "n/a (seed=None)"
+                )
+                print(
+                    f"[data-diversity] rank={rank} sampler_seed={seed_val} "
+                    f"epoch0_first_idx={preview}",
+                    file=sys.stderr, flush=True,
+                )
+            except Exception as exc:
+                print(f"[data-diversity] log failed: {exc}",
+                      file=sys.stderr, flush=True)
+            self._logged_sampler_diversity = True
+
+        # persistent_workers=False: the worker pool (+ its pinned buffers, Mongo
+        # clients and IPC semaphores) is torn down and recreated every epoch
+        # instead of living for the whole run. With persistent_workers=True the
+        # per-epoch worker state accumulated ~28GB/epoch (host RAM) and OOM'd the
+        # node at epoch 27 -- the "leaked semaphore" signature is worker IPC that
+        # never got released. Re-spawn cost is a few seconds vs a ~7.5 min epoch
+        # (run is compute-bound), so this is nearly free. The EpochShuffleBatchSampler
+        # counter lives in the main process, so reshuffling is unaffected.
         tdataloader = BatchPrefetchLoaderWrapper(
             DataLoader(
                 tdataset,
@@ -435,14 +769,14 @@ class CustomRunner(dl.Runner):
                 collate_fn=self.collate,
                 pin_memory=True,
                 worker_init_fn=self.funcs["createclient"],
-                persistent_workers=True,
-                prefetch_factor=4,
-                num_workers=4,  # self.prefetches,
+                persistent_workers=self.persistent_workers,
+                prefetch_factor=self.prefetch_factor,
+                num_workers=self.num_workers,
             ),
             num_prefetches=self.prefetches,
         )
 
-        vdataset = MongoDataset(
+        vdataset = MongoheadDataset(
             range(32),
             self.funcs["mytransform"],
             None,
@@ -459,6 +793,13 @@ class CustomRunner(dl.Runner):
             )
         )
 
+        # Validation is a tiny set (range(32), ~1 iter/epoch). With
+        # persistent_workers=True it would keep a SECOND full worker pool
+        # (num_workers x pinned buffers x Mongo clients) resident for the whole
+        # run, on top of the train loader's -- the resident step that OOM'd host
+        # RAM at the first epoch boundary. Use a couple of NON-persistent workers
+        # that are released after each validation, and a shallow prefetch queue.
+        valid_workers = min(2, self.num_workers)
         vdataloader = BatchPrefetchLoaderWrapper(
             DataLoader(
                 vdataset,
@@ -466,16 +807,39 @@ class CustomRunner(dl.Runner):
                 collate_fn=self.collate,
                 pin_memory=True,
                 worker_init_fn=self.funcs["createclient"],
-                persistent_workers=True,
-                prefetch_factor=2,
-                num_workers=4,  # self.prefetches,
+                persistent_workers=False,
+                prefetch_factor=self.valid_prefetch_factor,
+                num_workers=valid_workers,
             ),
-            num_prefetches=self.prefetches,
+            num_prefetches=min(2, self.prefetches),
         )
 
         return {"train": tdataloader, "valid": vdataloader}
 
     def get_model(self):
+        if getattr(self, "use_spatial_ae", False) and not self.use_refiner:
+            # Peak-memory-neutral spatial-AE bottleneck around the dilated trunk
+            # (no skips). Inherits CheckpointMixin, so use_checkpoint /
+            # checkpoint_segments / channels_last behave as for the flat model.
+            model = SpatialAEMeshNet(
+                in_channels=1,
+                n_classes=self.n_classes,
+                channels=self.n_channels,
+                config_file=self.config_file,
+                affine=self.affine,
+                bottleneck_mult=getattr(self, "spatial_ae_mult", 2),
+                downsample=getattr(self, "spatial_ae_down", "avgpool"),
+                upsample=getattr(self, "spatial_ae_up", "transposed"),
+            )
+            model.use_checkpoint = self.use_checkpoint
+            print(
+                f"[get_model] SpatialAEMeshNet mult={getattr(self, 'spatial_ae_mult', 2)} "
+                f"down={getattr(self, 'spatial_ae_down', 'avgpool')} "
+                f"up={getattr(self, 'spatial_ae_up', 'transposed')} "
+                f"use_checkpoint={self.use_checkpoint}",
+                file=sys.stderr, flush=True,
+            )
+            return model
         if self.use_refiner:
             if self.shape > self.maxshape:
                 model = enDynamicMesh(
@@ -527,6 +891,7 @@ class CustomRunner(dl.Runner):
                 extra_kwargs = (
                     self.se_kwargs if self.use_se
                     else self.me_kwargs if self.meshnetme
+                    else {"affine": self.affine} if self.groupnorm
                     else {}
                 )
                 model = modelClass(
@@ -536,16 +901,75 @@ class CustomRunner(dl.Runner):
                     config_file=self.config_file,
                     **extra_kwargs,
                 )
+        # Checkpointed model variants honor this flag in train_forward;
+        # the manual-backprop variants (enMesh/enMesh_SE/enDynamicMesh) ignore it.
+        model.use_checkpoint = self.use_checkpoint
+        print(
+            f"[get_model] {model.__class__.__name__} "
+            f"use_checkpoint={self.use_checkpoint} shape={self.shape} maxshape={self.maxshape}",
+            file=sys.stderr, flush=True,
+        )
+
+        # Two-head student: keep the deployment head, add a parallel aux head
+        # matching the teacher's class count. Load the resume weights into the
+        # single-head base BEFORE wrapping (keys match exactly), then attach the
+        # fresh aux head. Use paths.loadcheckpoint=false for this run so Catalyst
+        # does not also try to resume into the wrapper; init_from drives it here.
+        th = getattr(self, "two_head_cfg", None)
+        if th and th.get("enabled", False):
+            from two_head import TwoHeadMeshNet
+            init_from = th.get("init_from") or (self.model_path or "")
+            if init_from and os.path.isfile(init_from):
+                sd = _strip_compile_prefix(load_checkpoint(init_from))
+                # tolerate BOTH a single-head checkpoint (model.*) and a two-head
+                # one (base.*/head_aux.*): strip base., drop head_aux, so the base
+                # loads cleanly either way (aux head reinitializes fresh here; if
+                # resuming a two-head run, _load then restores the trained aux).
+                base_sd = {}
+                for k, v in sd.items():
+                    if k.startswith("head_aux."):
+                        continue
+                    base_sd[k[len("base."):] if k.startswith("base.") else k] = v
+                missing, unexpected = model.load_state_dict(base_sd, strict=False)
+                print(f"[two_head] base loaded from {init_from} "
+                      f"({len(missing)} missing, {len(unexpected)} unexpected)",
+                      file=sys.stderr, flush=True)
+            else:
+                print(f"[two_head] WARNING: init_from not found ({init_from!r}); "
+                      f"base starts from random init", file=sys.stderr, flush=True)
+            model = TwoHeadMeshNet(model, aux_classes=int(th.get("aux_classes", 18)))
+            model.use_checkpoint = self.use_checkpoint
+            print(f"[two_head] wrapped: deploy={model.n_classes} aux={model.aux_classes}",
+                  file=sys.stderr, flush=True)
+
+        # JDX pressure: tap the per-layer trunk activations via forward hooks.
+        # Registered here (before Catalyst's DDP wrap + the in-place
+        # torch.compile on the first batch) so the hooks are part of the
+        # initial compiled graph and never trigger a recompile.
+        self._register_jdx_hooks(model)
         return model
 
     def get_criterion(self):
         class_weight = torch.FloatTensor(
             [self.off_brain_weight] + [1.0] * (self.n_classes - 1)
         ).to(self.engine.device)
+        label_smoothing = getattr(self, "label_smoothing", 0.01)
+        generalized = getattr(self, "dice_generalized", False)
+
+        # Fused path: one log_softmax shared by CE and Dice (saves a full
+        # softmax volume at 104 classes / 256^3). Opt-in via cfg.model.loss_fused.
+        if getattr(self, "loss_fused", False):
+            return CEDiceLoss(
+                loss_weight=tuple(self.loss_weight),
+                class_weight=class_weight,
+                label_smoothing=label_smoothing,
+                generalized=generalized,
+            ).to(self.engine.device)
+
         ce_criterion = torch.nn.CrossEntropyLoss(
-            weight=class_weight, label_smoothing=0.01
+            weight=class_weight, label_smoothing=label_smoothing
         )
-        dice_criterion = DiceLoss()
+        dice_criterion = DiceLoss(generalized=generalized)
 
         def combined_loss(output, target):
             if self.loss_weight[0] == 1:
@@ -560,21 +984,102 @@ class CustomRunner(dl.Runner):
 
         return combined_loss
 
+    @staticmethod
+    def _decay_param_groups(model, weight_decay):
+        """Split params so decay hits only conv weights. GroupNorm gamma/beta
+        (1-D) and biases get weight_decay=0 -- decaying the affine scale would
+        fight the deep GroupNorm stack."""
+        decay, no_decay = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim <= 1 or name.endswith(".bias"):  # GroupNorm gamma/beta + biases
+                no_decay.append(p)
+            else:
+                decay.append(p)                          # conv weights
+        return [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+
     def get_optimizer(self, model):
         # optimizer = torch.optim.RMSprop(model.parameters(), lr=self.rmsprop_lr)
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.onecycle_lr)
+        wd = float(getattr(self, "weight_decay", 0.0))
+        if wd > 0.0:
+            # AdamW (decoupled decay), excluding norms/biases. Top-level
+            # weight_decay=0.0 so the per-group values are authoritative.
+            groups = self._decay_param_groups(model, wd)
+            optimizer = torch.optim.AdamW(
+                groups, lr=self.onecycle_lr, weight_decay=0.0
+            )
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=self.onecycle_lr)
         return optimizer
 
     def get_scheduler(self, optimizer):
+        # With gradient accumulation the optimizer (and thus the scheduler) steps
+        # once per `accum_steps` micro-batches, so OneCycle's total step budget
+        # must shrink accordingly. accum_steps=1 reproduces the old schedule.
+        accum = max(1, int(getattr(self, "accum_steps", 1)))
+        steps_per_epoch = max(1, len(self.loaders["train"]) // accum)
+        # pct_start is the FRACTION of the whole cycle spent ramping up. With the
+        # old 10-rep curriculum each cycle was short so 0.1 was fine; in a single
+        # long run (maxreps=1, many epochs) 0.1 becomes a huge warmup (e.g. ~75k
+        # steps) that pins LR at peak forever. Keep it small for single long runs.
+        pct_start = float(getattr(self, "sched_pct_start", 0.1))
+        div_factor = float(getattr(self, "sched_div_factor", 100.0))
+        final_div_factor = float(getattr(self, "sched_final_div", 1e4))
         scheduler = OneCycleLR(
             optimizer,
             max_lr=self.onecycle_lr,
-            div_factor=100,
-            pct_start=0.1,
+            div_factor=div_factor,
+            final_div_factor=final_div_factor,
+            pct_start=pct_start,
             epochs=self.num_epochs,
-            steps_per_epoch=len(self.loaders["train"]),
+            steps_per_epoch=steps_per_epoch,
         )
         return scheduler
+
+    # ----------------------- EMA (eval/checkpoint weights) -----------------------
+    # Maintains an exponential moving average of the weights. The averaged
+    # weights are swapped in for the validation loader and held through the
+    # end-of-epoch checkpoint save (so the saved "best" model is the EMA model),
+    # then the raw training weights are restored at the next train loader start.
+    # All swaps are in-place (copy_/load_state_dict) so the optimizer keeps
+    # referencing the same parameter tensors. use_ema=False => fully inert.
+    def _ema_module(self):
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _ema_update(self):
+        if not getattr(self, "use_ema", False):
+            return
+        m = self._ema_module()
+        d = float(getattr(self, "ema_decay", 0.999))
+        with torch.no_grad():
+            msd = m.state_dict()
+            if getattr(self, "_ema_shadow", None) is None:
+                self._ema_shadow = {k: v.detach().clone() for k, v in msd.items()}
+                return
+            for k, v in self._ema_shadow.items():
+                src = msd[k]
+                if v.is_floating_point():
+                    v.mul_(d).add_(src.detach().to(v.dtype), alpha=1.0 - d)
+                else:
+                    v.copy_(src)
+
+    def _ema_swap_in(self):
+        if getattr(self, "_ema_shadow", None) is None:
+            return
+        m = self._ema_module()
+        self._ema_backup = {k: v.detach().clone() for k, v in m.state_dict().items()}
+        m.load_state_dict(self._ema_shadow, strict=False)
+
+    def _ema_restore(self):
+        if getattr(self, "_ema_backup", None) is None:
+            return
+        m = self._ema_module()
+        m.load_state_dict(self._ema_backup, strict=False)
+        self._ema_backup = None
 
     def get_callbacks(self):
         checkpoint_params = {
@@ -587,7 +1092,7 @@ class CustomRunner(dl.Runner):
         if self.model_path:
             checkpoint_params.update({"resume_model": self.model_path})
         return {
-            "checkpoint": dl.CheckpointCallback(
+            "checkpoint": CompileSafeCheckpointCallback(
                 self._logdir, **checkpoint_params
             ),
             "tqdm": dl.TqdmCallback(),
@@ -604,10 +1109,27 @@ class CustomRunner(dl.Runner):
             keys += ["refiner_iters_mean", "refiner_iters_min", "refiner_iters_max", "refiner_iters_relative_mean", "refiner_residual_mean", "refiner_residual_min", "refiner_residual_max", "refiner_avg_kernel_delta", "refiner_avg_alpha", "refiner_coeff_abs_mean", "refiner_coeff_abs_max", "refiner_delta_penalty", "refiner_scheduled_blend", "refiner_effective_blend", "refiner_bypassed", "refiner_bypass_prob", "refiner_base_loss", "refiner_base_loss_weighted"]
         if self.is_rbp_model():
             keys += ["rbp_iters", "rbp_iters_relative", "rbp_residual", "rbp_state_delta"]
+        # (two-head kd/marg are wandb-only, logged directly in handle_batch;
+        #  intentionally NOT meters, so they never reach the tqdm bar.)
         self.meters = {
             key: metrics.AdditiveValueMetric(compute_on_call=False)
             for key in keys
         }
+        # EMA: validate (and checkpoint) on averaged weights; restore raw
+        # weights at the next train loader. Also reset gradient-accumulation
+        # state and clear any stale grads at the start of each train loader.
+        loader_key = getattr(runner, "loader_key", "")
+        if getattr(self, "use_ema", False):
+            if loader_key == "valid":
+                self._ema_swap_in()
+            elif loader_key == "train":
+                self._ema_restore()
+        if loader_key == "train":
+            self._accum_count = 0
+            try:
+                self.optimizer.zero_grad()
+            except Exception:
+                pass
 
     def on_loader_end(self, runner):
         """
@@ -619,6 +1141,7 @@ class CustomRunner(dl.Runner):
             keys += ["refiner_iters_mean", "refiner_iters_min", "refiner_iters_max", "refiner_iters_relative_mean", "refiner_residual_mean", "refiner_residual_min", "refiner_residual_max", "refiner_avg_kernel_delta", "refiner_avg_alpha", "refiner_coeff_abs_mean", "refiner_coeff_abs_max", "refiner_delta_penalty", "refiner_scheduled_blend", "refiner_effective_blend", "refiner_bypassed", "refiner_bypass_prob", "refiner_base_loss", "refiner_base_loss_weighted"]
         if self.is_rbp_model():
             keys += ["rbp_iters", "rbp_iters_relative", "rbp_residual", "rbp_state_delta"]
+        # (two-head kd/marg are wandb-only, not meters -- see handle_batch.)
         loader_key = getattr(runner, "loader_key", getattr(self, "loader_key", "loader"))
         refiner_epoch_metrics = {}
         for key in keys:
@@ -642,14 +1165,97 @@ class CustomRunner(dl.Runner):
                     )
             except Exception:
                 pass
+        # Per-epoch cleanup insurance against host-RAM creep: force a GC sweep so
+        # any dropped-but-uncollected loader/prefetch references (and their pinned
+        # buffers) are freed at the loader boundary. NOTE: do NOT empty_cache() here
+        # -- the leak is HOST RAM; empty_cache only releases GPU blocks and forces a
+        # slow cudaMalloc re-grow on the next epoch (added latency, no benefit).
+        gc.collect()
         super().on_loader_end(runner)
+
+    def _get_distiller(self):
+        """Lazily build the frozen teacher (device is only known once Catalyst
+        set up the runner). Returns None if no teacher is configured. Shared by
+        the single-head (marginalized) and two-head (raw-18) KD paths. The
+        teacher runs train-time only, under no_grad, in eval -- peak memory and
+        export are unaffected."""
+        cfg = getattr(self, "distill_cfg", None)
+        if not cfg or not cfg.get("teacher_checkpoint"):
+            return None
+        if getattr(self, "_distiller", None) is None:
+            _bf16 = str(getattr(self, "amp_dtype", "float16")).lower() in ("bf16", "bfloat16")
+            self._distiller = Distiller(
+                checkpoint_path=cfg["teacher_checkpoint"],
+                device=self.engine.device,
+                teacher_channels=int(cfg.get("teacher_channels", 16)),
+                teacher_classes=int(cfg.get("teacher_classes", 18)),
+                student_classes=self.n_classes,
+                config_file=cfg.get("teacher_config_file", self.config_file),
+                affine=bool(cfg.get("teacher_affine", True)),
+                temperature=float(cfg.get("temperature", 2.0)),
+                amp_dtype=torch.bfloat16 if _bf16 else torch.float16,
+                channels_last=bool(getattr(self, "channels_last", True)),
+            )
+        return self._distiller
+
+    def _maybe_kd_loss(self, y_hat, sample):
+        """Single-head (marginalized 18->3) KD term. Returns (kd, alpha) or
+        (None, 0.0) when disabled. Superseded by the two-head path when
+        model.two_head.enabled is set."""
+        cfg = getattr(self, "distill_cfg", None)
+        if not cfg or not cfg.get("enabled", False) or not self.model.training:
+            return None, 0.0
+        d = self._get_distiller()
+        if d is None:
+            return None, 0.0
+        alpha = float(cfg.get("alpha", 0.5))
+        kd = d.kd_loss(y_hat, sample)
+        self._last_kd = kd.detach()
+        return kd, alpha
+
+    def _two_head_on(self):
+        th = getattr(self, "two_head_cfg", None)
+        return bool(th and th.get("enabled", False))
+
+    def _kd_weight_now(self):
+        """Effective KD weight with a linear warmup. The raw 18-class KD is a
+        T^2-scaled KL summed over 18 classes -- at init (random aux head) it is
+        ~20-30x the 3-class dice+CE, so a large kd_weight lets it overwrite the
+        resumed trunk (the deploy dice unlearns). Keep kd_weight small and ramp
+        it in so the aux head first becomes sensible before it reshapes the
+        trunk."""
+        th = self.two_head_cfg
+        w = float(th.get("kd_weight", 0.05))
+        self._kd_step = getattr(self, "_kd_step", 0) + 1   # single per-step counter
+        warm = int(th.get("kd_warmup_steps", 2000))
+        if warm > 0:
+            w *= min(1.0, self._kd_step / warm)
+        return w
+
+    def _marg_weight_now(self):
+        """Effective weight for the marginal-consistency loss, with its own
+        warmup. Must be called AFTER _kd_weight_now() each step (that advances
+        the shared step counter). Ramping delays it while the aux head is still
+        random -- chasing a garbage marginal early would hurt the deploy head."""
+        th = self.two_head_cfg
+        lm = float(th.get("lambda_marg", 0.0))
+        if lm <= 0.0:
+            return 0.0
+        warm = int(th.get("marg_warmup_steps", th.get("kd_warmup_steps", 2000)))
+        step = getattr(self, "_kd_step", 0)
+        if warm > 0:
+            lm *= min(1.0, step / warm)
+        return lm
 
     # model train/valid step
     def handle_batch(self, batch):
-        # Add synchronization before processing
-        if self.engine.is_ddp:
+        # Per-step full device sync. Default ON (historical behavior). It
+        # serializes CPU<->GPU and can cost throughput; set perf.ddp_batch_sync
+        # =False to drop it and A/B. Kept default-True so nothing changes unless
+        # explicitly opted out.
+        if self.engine.is_ddp and getattr(self, "ddp_batch_sync", True):
             torch.cuda.synchronize()
-        
+
         sample, label = batch
         refiner_delta_penalty = torch.zeros((), device=sample.device)
         refiner_base_loss = torch.zeros((), device=sample.device)
@@ -661,6 +1267,15 @@ class CustomRunner(dl.Runner):
         # stop
         # run model forward/backward pass
         if self.model.training:
+            # JDX: drop any activations captured by a previous (non-consuming)
+            # forward and advance the warmup counter once per training step.
+            if self.jdx_enabled:
+                self._jdx_acts = []
+                self._jdx_step += 1
+                self._jdx_region = (
+                    self._jdx_foreground_region(label)
+                    if self.jdx_foreground else None
+                )
             if scheduled_blend > 0 and self.refiner_bypass_prob > 0 and self.ddp_shared_random(sample.device) < self.refiner_bypass_prob:
                 effective_blend = 0.0
                 refiner_bypassed = 1.0
@@ -681,16 +1296,35 @@ class CustomRunner(dl.Runner):
                     )
             else:
                 if self.bit16:
+                    _bf16 = str(getattr(self, "amp_dtype", "float16")).lower() in ("bf16", "bfloat16")
+                    _amp_dtype = torch.bfloat16 if _bf16 else torch.float16
                     with torch.amp.autocast(
-                        device_type="cuda", dtype=torch.float16
+                        device_type="cuda", dtype=_amp_dtype
                     ):
-                        y_hat = self.model.forward(sample)
-                        # print("y_hat.shape: ", y_hat.shape)
-                        # print("label.shape: ", label.shape)
-                        # stop
+                        if self._two_head_on() and self.model.training:
+                            y_hat, y_aux = self.model(sample, return_aux=True)
+                        else:
+                            y_hat, y_aux = self.model.forward(sample), None
 
                         loss = self.criterion(y_hat, label)
+                        if y_aux is not None:
+                            _d = self._get_distiller()
+                            if _d is not None:
+                                _kd18 = _d.kd18_loss(y_aux, sample)
+                                self._last_kd = _kd18.detach()
+                                loss = loss + self._kd_weight_now() * _kd18
+                                _lm = self._marg_weight_now()
+                                if _lm > 0.0:
+                                    _mc = _d.marginal_consistency_loss(y_hat, y_aux)
+                                    self._last_marg = _mc.detach()
+                                    loss = loss + _lm * _mc
+                        else:
+                            _kd, _alpha = self._maybe_kd_loss(y_hat, sample)
+                            if _kd is not None:
+                                loss = (1.0 - _alpha) * loss + _alpha * _kd
                         loss = loss + self.me_weight_diversity_lambda * self.get_me_weight_diversity_penalty(loss.device)
+                        if self.jdx_enabled:
+                            loss = loss + self._jdx_weight_now() * self.get_jdx_penalty(loss.device)
                         refiner_delta_penalty = self.get_refiner_delta_penalty(loss.device)
                         if self.refiner_delta_lambda > 0:
                             loss = loss + self.refiner_delta_lambda * refiner_delta_penalty
@@ -703,11 +1337,37 @@ class CustomRunner(dl.Runner):
                             del y_hat_base
                             self.set_refiner_blend(effective_blend)
                             self.restore_refiner_stats(refiner_stats_snapshot)
-                    scaler.scale(loss).backward()
+                    # Gradient accumulation: scale the loss so accumulated grads
+                    # average (not sum). bf16 needs no GradScaler.
+                    _accum = max(1, int(getattr(self, "accum_steps", 1)))
+                    if _bf16:
+                        (loss / _accum).backward()
+                    else:
+                        scaler.scale(loss / _accum).backward()
                 else:
-                    y_hat = self.model.forward(sample)
+                    if self._two_head_on() and self.model.training:
+                        y_hat, y_aux = self.model(sample, return_aux=True)
+                    else:
+                        y_hat, y_aux = self.model.forward(sample), None
                     loss = self.criterion(y_hat, label)
+                    if y_aux is not None:
+                        _d = self._get_distiller()
+                        if _d is not None:
+                            _kd18 = _d.kd18_loss(y_aux, sample)
+                            self._last_kd = _kd18.detach()
+                            loss = loss + self._kd_weight_now() * _kd18
+                            _lm = self._marg_weight_now()
+                            if _lm > 0.0:
+                                _mc = _d.marginal_consistency_loss(y_hat, y_aux)
+                                self._last_marg = _mc.detach()
+                                loss = loss + _lm * _mc
+                    else:
+                        _kd, _alpha = self._maybe_kd_loss(y_hat, sample)
+                        if _kd is not None:
+                            loss = (1.0 - _alpha) * loss + _alpha * _kd
                     loss = loss + self.me_weight_diversity_lambda * self.get_me_weight_diversity_penalty(loss.device)
+                    if self.jdx_enabled:
+                        loss = loss + self._jdx_weight_now() * self.get_jdx_penalty(loss.device)
                     refiner_delta_penalty = self.get_refiner_delta_penalty(loss.device)
                     if self.refiner_delta_lambda > 0:
                         loss = loss + self.refiner_delta_lambda * refiner_delta_penalty
@@ -720,19 +1380,47 @@ class CustomRunner(dl.Runner):
                         del y_hat_base
                         self.set_refiner_blend(effective_blend)
                         self.restore_refiner_stats(refiner_stats_snapshot)
-                    loss.backward()
+                    (loss / max(1, int(getattr(self, "accum_steps", 1)))).backward()
             if not self.optimize_inline:
-                if self.bit16:
+                # Gradient accumulation: backward runs every micro-step (grads
+                # accumulate because zero_grad only fires on a real step); the
+                # optimizer/scheduler/EMA only advance every accum_steps.
+                _accum = max(1, int(getattr(self, "accum_steps", 1)))
+                self._accum_count = getattr(self, "_accum_count", 0) + 1
+                if self._accum_count >= _accum:
+                    _use_scaler = self.bit16 and str(getattr(self, "amp_dtype", "float16")).lower() not in ("bf16", "bfloat16")
                     self.zero_refiner_grads()
-                    scaler.step(self.optimizer)
-                    self.scheduler.step()
-                    scaler.update()
-                    self.optimizer.zero_grad()
-                else:
-                    self.zero_refiner_grads()
-                    self.optimizer.step()
-                    self.scheduler.step()
-                    self.optimizer.zero_grad()
+                    # Gradient clipping: bound the (accumulated) grad norm so an
+                    # occasional outlier batch can't knock the weights off (the
+                    # transient train-dice collapses). fp16 grads must be unscaled
+                    # first to measure the true norm. If the norm is non-finite
+                    # (NaN/Inf), SKIP the step entirely so a bad batch never lands.
+                    # grad_clip <= 0 disables (old behavior).
+                    _clip = float(getattr(self, "grad_clip", 0.0))
+                    _skip_step = False
+                    if _clip > 0:
+                        if _use_scaler:
+                            scaler.unscale_(self.optimizer)
+                        total_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), _clip
+                        )
+                        _skip_step = not bool(torch.isfinite(total_norm))
+                    if _skip_step:
+                        # Drop this update; keep scaler/LR/EMA aligned with real steps.
+                        if _use_scaler:
+                            scaler.update()
+                        self.optimizer.zero_grad()
+                        self._accum_count = 0
+                    else:
+                        if _use_scaler:
+                            scaler.step(self.optimizer)
+                            scaler.update()
+                        else:
+                            self.optimizer.step()
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
+                        self._accum_count = 0
+                        self._ema_update()
         else:
             self.set_refiner_blend(self.refiner_blend)
             with torch.no_grad():
@@ -740,12 +1428,46 @@ class CustomRunner(dl.Runner):
                 loss = self.criterion(y_hat, label)
                 loss = loss + self.me_weight_diversity_lambda * self.get_me_weight_diversity_penalty(loss.device)
                 refiner_delta_penalty = self.get_refiner_delta_penalty(loss.device)
-        with torch.inference_mode():
-            result = torch.squeeze(torch.argmax(y_hat, 1)).long()
-            labels = torch.squeeze(label)
-            dice = torch.mean(
-                faster_dice(result, labels, range(self.n_classes))
-            )
+        # The macro_dice metric (argmax + faster_dice over n_classes) is a
+        # monitoring-only quantity -- it is NOT part of the loss when
+        # loss_weight=[1,0]. At 256^3 x 104 classes it is expensive in both
+        # compute and peak memory, so during training we compute it only every
+        # dice_every_n_steps steps and carry the last value forward in between.
+        # On the skipped steps we compute a cheap *approximate* dice on a
+        # strided spatial subsample (e.g. every 4th voxel per axis ≈ 64×
+        # fewer voxels) so the monitoring curve stays informative.
+        # Validation always computes the full dice (it is the eval metric).
+        is_train = self.model.training
+        n_every = getattr(self, "dice_every_n_steps", 1) or 1
+        if is_train:
+            self._dice_step = getattr(self, "_dice_step", 0) + 1
+        compute_dice = (
+            (not is_train)
+            or n_every <= 1
+            or getattr(self, "_last_dice", None) is None
+            or (self._dice_step % n_every == 0)
+        )
+        if compute_dice:
+            with torch.inference_mode():
+                result = torch.squeeze(torch.argmax(y_hat, 1)).long()
+                labels = torch.squeeze(label)
+                dice = torch.mean(
+                    faster_dice(result, labels, range(self.n_classes))
+                )
+            self._last_dice = dice.detach()
+            approx_dice = dice.detach()  # full dice IS the approx on compute steps
+        else:
+            dice = self._last_dice
+            # Cheap approximate dice on a strided spatial subsample.
+            stride = getattr(self, "dice_subsample_stride", 4) or 4
+            with torch.inference_mode():
+                sub_hat = y_hat[..., ::stride, ::stride, ::stride]
+                sub_lbl = label[..., ::stride, ::stride, ::stride]
+                sub_result = torch.squeeze(torch.argmax(sub_hat, 1)).long()
+                sub_labels = torch.squeeze(sub_lbl)
+                approx_dice = torch.mean(
+                    faster_dice(sub_result, sub_labels, range(self.n_classes))
+                ).detach()
 
         # Collect refiner convergence stats if available
         refiner_iters = []
@@ -784,6 +1506,8 @@ class CustomRunner(dl.Runner):
         rbp_metrics_dict = {}
         
         meter_keys = ["loss", "macro_dice", "learning rate"]
+        # NOTE: two-head kd/marg are logged wandb-ONLY (below), like approx_dice,
+        # so they stay OFF the tqdm bar.
         if refiner_iters:
             import math
             clean_iters = [it for it in refiner_iters if it is not None and not math.isnan(it) and not math.isinf(it)]
@@ -835,6 +1559,53 @@ class CustomRunner(dl.Runner):
 
         self.batch_metrics.update(metrics_dict)
 
+        # approx_dice -> wandb only (NOT batch_metrics), so it never shows in tqdm.
+        # Catalyst's WandbLogger logs all batch metrics with an explicit
+        # step=runner.sample_step. A wandb.log() with NO step resolves to wandb's
+        # internal counter, conflicts with those explicit steps, and gets dropped
+        # -> it showed in neither tqdm nor wandb. Log at the SAME sample_step (and
+        # with Catalyst's "{key}_batch/{loader}" naming) so it lands on the same
+        # row next to macro_dice_batch/<loader>.
+        try:
+            import wandb
+            if wandb.run is not None:
+                loader_key = getattr(self, "loader_key", "train")
+                step = getattr(self, "sample_step",
+                               getattr(self, "global_sample_step", None))
+                if step is None:
+                    step = wandb.run.step
+                wandb.log(
+                    {f"approx_dice_batch/{loader_key}": float(approx_dice)},
+                    step=step,
+                    commit=False,
+                )
+        except Exception:
+            pass
+
+        # two-head KD / marginal-consistency -> wandb only (never in tqdm), same
+        # naming/step convention as approx_dice so they land as kd_batch/<loader>
+        # and marg_batch/<loader>.
+        if self._two_head_on() and self.model.training:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    loader_key = getattr(self, "loader_key", "train")
+                    step = getattr(self, "sample_step",
+                                   getattr(self, "global_sample_step", None))
+                    if step is None:
+                        step = wandb.run.step
+                    payload = {}
+                    if getattr(self, "_last_kd", None) is not None:
+                        payload[f"kd_batch/{loader_key}"] = float(self._last_kd)
+                    if getattr(self, "_last_marg", None) is not None:
+                        payload[f"marg_batch/{loader_key}"] = float(self._last_marg)
+                    if getattr(self, "_last_jdx", None) is not None:
+                        payload[f"jdx_batch/{loader_key}"] = float(self._last_jdx)
+                    if payload:
+                        wandb.log(payload, step=step, commit=False)
+            except Exception:
+                pass
+
         if refiner_metrics_dict:
             try:
                 import wandb
@@ -875,8 +1646,9 @@ class CustomRunner(dl.Runner):
         del sample
         del label
         del y_hat
-        del result
-        del labels
+        if compute_dice:
+            del result
+            del labels
         del loss
 
 
@@ -966,8 +1738,24 @@ def main(cfg: DictConfig):
     model_channels = cfg.model.model_channels
     model_label = cfg.model.model_label
     use_groupnorm = cfg.model.use_groupnorm
+    use_affine = cfg.model.get("use_affine", False)
     use_refiner = cfg.model.get("use_refiner", False)
     use_se = cfg.model.get("use_se", False)
+    use_checkpoint = cfg.model.get("use_checkpoint", True)
+    # convergence-speed + EMA + spatial-AE knobs (all default to old behavior)
+    accum_steps = int(cfg.experiment.get("accum_steps", 1))
+    amp_dtype = str((cfg.get("perf", {}) or {}).get("amp_dtype", "float16"))
+    use_ema = bool(cfg.model.get("use_ema", False))
+    ema_decay = float(cfg.model.get("ema_decay", 0.999))
+    use_spatial_ae = bool(cfg.model.get("use_spatial_ae", False))
+    spatial_ae_mult = int(cfg.model.get("spatial_ae_bottleneck_mult", 2))
+    spatial_ae_down = str(cfg.model.get("spatial_ae_downsample", "avgpool"))
+    spatial_ae_up = str(cfg.model.get("spatial_ae_upsample", "transposed"))
+    weight_decay = float(cfg.experiment.get("weight_decay", 0.0))
+    grad_clip = float(cfg.experiment.get("grad_clip", 0.0))
+    sched_pct_start = float(cfg.experiment.get("pct_start", 0.1))
+    sched_div_factor = float(cfg.experiment.get("div_factor", 100.0))
+    sched_final_div = float(cfg.experiment.get("final_div_factor", 1e4))
     se_cfg = cfg.model.get("se", {})
     se_kwargs = OmegaConf.to_container(se_cfg, resolve=True) if se_cfg else {}
     me_cfg = cfg.model.get("me", {})
@@ -980,6 +1768,11 @@ def main(cfg: DictConfig):
     refiner_bypass_prob = cfg.model.get("refiner_bypass_prob", 0.0)
     refiner_base_loss_lambda = cfg.model.get("refiner_base_loss_lambda", 0.0)
     me_weight_diversity_lambda = cfg.model.get("me_weight_diversity_lambda", 0.0)
+    jdx_cfg = cfg.model.get("jdx", {})
+    jdx_kwargs = OmegaConf.to_container(jdx_cfg, resolve=True) if jdx_cfg else {}
+    label_smoothing = cfg.model.get("label_smoothing", 0.01)
+    dice_generalized = cfg.model.get("dice_generalized", False)
+    loss_fused = cfg.model.get("loss_fused", False)
     model_path = cfg.paths.model if cfg.paths.loadcheckpoint else ""
     logdir = cfg.paths.logdir
     db_host = cfg.mongo.host_slurm if os.environ.get("SLURM_JOB_ID") else cfg.mongo.host
@@ -990,6 +1783,22 @@ def main(cfg: DictConfig):
     wandb_project = cfg.wandb.project
 
     bit16 = cfg.bit16
+
+    # DataLoader knobs (config-driven; defaults preserve previous hardcoded 4/4/2)
+    dl_cfg = cfg.get("dataloader", {}) or {}
+    num_workers = int(dl_cfg.get("num_workers", 4))
+    persistent_workers = bool(dl_cfg.get("persistent_workers", False))
+    prefetch_factor = int(dl_cfg.get("prefetch_factor", 4))
+    valid_prefetch_factor = int(dl_cfg.get("valid_prefetch_factor", 2))
+
+    # Training-only macro_dice metric cadence (validation always computes it).
+    metrics_cfg = cfg.get("metrics", {}) or {}
+    dice_every_n_steps = int(metrics_cfg.get("dice_every_n_steps", 1))
+
+    # Per-step DDP device sync; default True = historical behavior.
+    perf_cfg = cfg.get("perf", {}) or {}
+    ddp_batch_sync = bool(perf_cfg.get("ddp_batch_sync", True))
+    dice_subsample_stride = int(metrics_cfg.get("dice_subsample_stride", 4))
 
     client_creator = ClientCreator(
         db_host, crop_tensor=cfg.client_creator.crop_tensor
@@ -1071,9 +1880,17 @@ def main(cfg: DictConfig):
             num_subcubes=numcubes[experiment],
             num_volumes=numvolumes[experiment],
             groupnorm=use_groupnorm,
+            affine=use_affine,
             client_creator=client_creator,
             off_brain_weight=weights[experiment],
             prefetches=prefetches[experiment],
+            num_workers=num_workers,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            valid_prefetch_factor=valid_prefetch_factor,
+            dice_every_n_steps=dice_every_n_steps,
+            dice_subsample_stride=dice_subsample_stride,
+            ddp_batch_sync=ddp_batch_sync,
             indexid=cfg.mongo.index_id,
             db_collection=collections[experiment],
             db_name=databases[experiment],
@@ -1081,6 +1898,9 @@ def main(cfg: DictConfig):
             subvolume_shape=subvolume_shape,
             lowprecision=bit16,
             lossweight = [w / sum(cfg.model.loss_weight) for w in cfg.model.loss_weight] if sum(cfg.model.loss_weight) != 0 else ValueError("The sum of loss weights cannot be zero."),
+            label_smoothing=label_smoothing,
+            dice_generalized=dice_generalized,
+            loss_fused=loss_fused,
             meshnetme=cfg.model.use_me,
             db_host=db_host,
             wandb_team=cfg.wandb.team,
@@ -1102,6 +1922,34 @@ def main(cfg: DictConfig):
             me_weight_diversity_lambda=me_weight_diversity_lambda,
             use_se=use_se,
             se_kwargs=se_kwargs,
+            use_checkpoint=use_checkpoint,
+            weight_decay=weight_decay,
+            grad_clip=grad_clip,
+            accum_steps=accum_steps,
+            amp_dtype=amp_dtype,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
+            use_spatial_ae=use_spatial_ae,
+            spatial_ae_mult=spatial_ae_mult,
+            spatial_ae_down=spatial_ae_down,
+            spatial_ae_up=spatial_ae_up,
+            sched_pct_start=sched_pct_start,
+            sched_div_factor=sched_div_factor,
+            sched_final_div=sched_final_div,
+            jdx_kwargs=jdx_kwargs,
+        )
+        # Knowledge distillation (optional): 18-class/16ch teacher -> student.
+        # Attached to the instance (not threaded through __init__) and built
+        # lazily on the first training batch, once the engine device is known.
+        _distill_cfg = cfg.model.get("distill", None)
+        runner.distill_cfg = (
+            OmegaConf.to_container(_distill_cfg, resolve=True)
+            if _distill_cfg is not None else None
+        )
+        _two_head_cfg = cfg.model.get("two_head", None)
+        runner.two_head_cfg = (
+            OmegaConf.to_container(_two_head_cfg, resolve=True)
+            if _two_head_cfg is not None else None
         )
         runner.run()
 
@@ -1114,6 +1962,12 @@ def main(cfg: DictConfig):
         )
 
         model_path = logdir + "model.last.pth"
+
+        # Release this rep's model/optimizer/runner before building the next one,
+        # so GPU allocations don't accumulate across curriculum reps.
+        del runner
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

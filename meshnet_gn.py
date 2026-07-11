@@ -86,7 +86,7 @@ def set_channel_num(config, in_channels, n_classes, channels):
     return config
 
 
-def construct_layer(dropout_p=0, bnorm=True, gelu=False, *args, **kwargs):
+def construct_layer(dropout_p=0, bnorm=True, gelu=False, affine=False, *args, **kwargs):
     """Constructs a configurable Convolutional block with Batch Normalization and Dropout.
 
     Args:
@@ -110,7 +110,7 @@ def construct_layer(dropout_p=0, bnorm=True, gelu=False, *args, **kwargs):
             nn.GroupNorm(
                 num_groups=kwargs["out_channels"],
                 num_channels=kwargs["out_channels"],
-                affine=False,
+                affine=affine,
             )
         )
 
@@ -246,8 +246,9 @@ class SequentialConvLayer(nn.Module):
 class MeshNet(nn.Module):
     """Configurable MeshNet from https://arxiv.org/pdf/1612.00940.pdf"""
 
-    def __init__(self, in_channels, n_classes, channels, config_file, fat=None):
+    def __init__(self, in_channels, n_classes, channels, config_file, fat=None, affine=False):
         """Init"""
+        self.affine = affine
         with open(config_file, "r") as f:
             config = set_channel_num(
                 json.load(f), in_channels, n_classes, channels
@@ -272,6 +273,7 @@ class MeshNet(nn.Module):
                 dropout_p=config["dropout_p"],
                 bnorm=config["bnorm"],
                 gelu=config["gelu"],
+                affine=self.affine,
                 # with layer-norm we need no bias as we z-score channels anyway
                 **{**block_kwargs, "bias": False},  # **block_kwargs,
             )
@@ -385,10 +387,44 @@ class MixedMeshNet(nn.Module):
 
 class CheckpointMixin:
     def train_forward(self, x):
+        if not getattr(self, "use_checkpoint", True):
+            return self.model(x)
         y = x
         y.requires_grad_()
+        n_layers = len(self.model)
+        # checkpoint_segments controls the recompute granularity:
+        #   None / <=0  -> one segment per layer (max memory saving, max recompute
+        #                  + kernel-launch overhead; the original behavior)
+        #   k           -> split the trunk into k segments, recompute one segment
+        #                  at a time. Fewer, larger segments => less recompute and
+        #                  fewer kernel launches at the cost of higher peak memory.
+        segments = getattr(self, "checkpoint_segments", None)
+        if not segments or segments < 1:
+            segments = n_layers
+
+        # Partial checkpointing: run the first `keep` layers normally (their
+        # activations are RETAINED, so they are NOT recomputed in backward) and
+        # checkpoint only the remaining suffix. This spends spare GPU memory to
+        # cut the recompute tax (the dominant cost on the deep model). keep=0
+        # (default) reproduces full checkpointing exactly. The slices are local
+        # (not assigned to self), so they share the registered layer modules and
+        # do NOT double-register parameters.
+        keep = int(getattr(self, "checkpoint_keep_layers", 0) or 0)
+        keep = max(0, min(keep, n_layers))
+        if keep > 0:
+            head = self.model[:keep]
+            tail = self.model[keep:]
+            y = head(y)
+            if len(tail) > 0:
+                seg = min(int(segments), len(tail))
+                y = checkpoint_sequential(
+                    tail, seg, y, preserve_rng_state=False, use_reentrant=False
+                )
+            return y
+
+        segments = min(int(segments), n_layers)
         y = checkpoint_sequential(
-            self.model, len(self.model), y, preserve_rng_state=False, use_reentrant=False
+            self.model, segments, y, preserve_rng_state=False, use_reentrant=False
         )
         return y
 
@@ -416,6 +452,113 @@ class xenMesh_checkpoint(CheckpointMixin, MixedMeshNet):
 
 class fenMesh_checkpoint(CheckpointMixin, FusedMeshNet):
     pass
+
+
+class SpatialAEMeshNet(CheckpointMixin, nn.Module):
+    """MeshNet dilated trunk wrapped in a peak-memory-neutral spatial
+    autoencoder bottleneck, with NO skip connections (anti-U-Net).
+
+    Data flow (R = full volume edge, e.g. 256):
+
+        in(1ch @ R^3)
+          -> stem    : Conv3 1->C            @ R^3      (full-res features)
+          -> down    : R^3 -> (R/2)^3, C->Cb            (avgpool+1x1, or strided)
+          -> trunk   : the dilated stack, Cb->Cb @ (R/2)^3   (the heavy compute)
+          -> up      : (R/2)^3 -> R^3, Cb->C            (transposed conv, or trilinear+conv)
+          -> refine  : Conv3 C->C            @ R^3      (full-res detail recovery)
+          -> head    : Conv1 C->n_classes    @ R^3
+        out(n_classes @ R^3)
+
+    Why this is peak-memory-neutral vs the flat trunk: the wide (Cb-channel)
+    dilated stack runs at (R/2)^3 = 1/8 the voxels, so its activations are
+    ~Cb/8 = C/4 of a single flat-trunk layer buffer. The only full-res
+    activations are the few C-channel stem/up/refine/head maps, each ~ one
+    flat-trunk layer. There are NO skips, so nothing is retained across the
+    bottleneck. Net peak ~= the flat model's peak (one C x R^3 buffer).
+
+    Why a bottleneck helps when TRAINING on SynthSeg (vs the flat trunk that
+    "gets the brain but misses the folds"): SynthSeg randomizes per-label
+    intensity every sample, so segmentation must come from geometry, not
+    intensity. avgpool downsampling averages out that per-label intensity
+    noise, and at (R/2)^3 a dense rate-1 3x3 already spans fold-scale extent
+    so the trunk reasons about shape without needing the largest dilations;
+    the learned transposed-conv upsample acts as a shape prior that
+    reconstructs the folded cortical ribbon.
+
+    Implementation note: ``self.model`` is a single flat ``nn.Sequential`` and
+    this class inherits ``CheckpointMixin``, so gradient checkpointing
+    (``use_checkpoint`` / ``checkpoint_segments`` / ``checkpoint_keep_layers``),
+    ``channels_last_3d`` and the train/eval forward contract behave EXACTLY as
+    for the flat ``enMesh_checkpoint(_gn)`` model -- the trainer needs no
+    special handling and calls ``model(sample) -> logits`` as usual.
+    """
+
+    def __init__(self, in_channels, n_classes, channels, config_file,
+                 affine=False, bottleneck_mult=2, downsample="avgpool",
+                 upsample="transposed"):
+        super().__init__()
+        C = int(channels)
+        Cb = int(channels) * int(bottleneck_mult)
+        with open(config_file, "r") as f:
+            cfg = json.load(f)
+        gelu = cfg.get("gelu", False)
+        bnorm = cfg.get("bnorm", True)
+        dropout_p = cfg.get("dropout_p", 0)
+        act = (lambda: nn.GELU()) if gelu else (lambda: nn.ReLU(inplace=True))
+
+        def block(cin, cout, k, pad, stride=1, dil=1):
+            # same conv+GroupNorm+act block factory the flat trunk uses
+            return construct_layer(
+                dropout_p=0, bnorm=bnorm, gelu=gelu, affine=affine,
+                in_channels=cin, out_channels=cout, kernel_size=k,
+                padding=pad, stride=stride, dilation=dil, bias=False,
+            )
+
+        layers = []
+        # --- full-res stem: 1 -> C ---
+        layers.append(block(in_channels, C, k=3, pad=1))
+
+        # --- downsample R -> R/2, C -> Cb ---
+        if downsample == "strided":
+            layers.append(block(C, Cb, k=2, pad=0, stride=2))
+        else:  # "avgpool": anti-aliased (averages SynthSeg intensity noise) + 1x1 expand
+            layers.append(nn.AvgPool3d(kernel_size=2, stride=2))
+            layers.append(block(C, Cb, k=1, pad=0))
+
+        # --- dilated trunk at R/2, Cb -> Cb (reuse the config_file schedule) ---
+        # Built with in=n_classes=channels=Cb so every layer (incl. the first
+        # and final 1x1) operates at width Cb; we splice in its conv blocks.
+        trunk = MeshNet(in_channels=Cb, n_classes=Cb, channels=Cb,
+                        config_file=config_file, affine=affine)
+        layers.extend(list(trunk.model))
+
+        # --- upsample R/2 -> R, Cb -> C ---
+        if upsample == "transposed":
+            layers.append(nn.ConvTranspose3d(Cb, C, kernel_size=2, stride=2,
+                                             bias=False))
+        else:  # "trilinear" + 3x3 conv
+            layers.append(nn.Upsample(scale_factor=2, mode="trilinear",
+                                      align_corners=False))
+            layers.append(nn.Conv3d(Cb, C, kernel_size=3, padding=1, bias=False))
+        if bnorm:
+            layers.append(nn.GroupNorm(num_groups=C, num_channels=C,
+                                       affine=affine))
+        layers.append(act())
+        if dropout_p > 0:
+            layers.append(nn.Dropout3d(dropout_p))
+
+        # --- full-res refine: C -> C ---
+        layers.append(block(C, C, k=3, pad=1))
+
+        # --- head: C -> n_classes (1x1, with bias; no norm/act) ---
+        head = nn.Conv3d(C, n_classes, kernel_size=1)
+        layers.append(head)
+
+        self.model = nn.Sequential(*layers)
+        init_weights(self.model)
+        # bias on the logit head (matches flat MeshNet's final-layer treatment)
+        if self.model[-1].bias is not None:
+            nn.init.constant_(self.model[-1].bias, 0.0)
 
 
 # class enMesh_checkpoint(MeshNet):

@@ -1071,6 +1071,8 @@ class enDynamicMesh_checkpoint(DynamicMeshNet):
     Memory cost ≈ 2 × one activation volume + refiner params.
     """
     def train_forward(self, x):
+        if not getattr(self, "use_checkpoint", True):
+            return self.model(x)
         y = x
         y.requires_grad_()
         y = checkpoint_sequential(

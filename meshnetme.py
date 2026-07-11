@@ -150,6 +150,8 @@ class MeshNetME_(nn.Module):
 
 class CheckpointMixin:
     def train_forward(self, x, model):
+        if not getattr(self, "use_checkpoint", True):
+            return model(x)
         y = x
         y.requires_grad_()
         y = checkpoint_sequential(

@@ -1,0 +1,23 @@
+{
+  "header": "MeshNet 13-layer deep gridding-free dilation schedule (RF ~= 256^3 volume) for 256^3 brains",
+  "comment": "Symmetric coprime ramp 1,3,5,7,13,19,31,19,13,7,5,3,1 (13 conv layers + final 1x1). RF = 1+2*sum = 1+2*127 = 255 voxels, i.e. matched to the 256 cube -- every output voxel sees the whole brain with essentially no wasted (all-padding) reach. All rates are odd, the gcd is 1 and a dilation=1 layer is present, so the aggregate receptive field has no gridding holes (Wang et al., WACV 2018). This adds 4 hidden layers vs modelAE_hdc_wide.json (9->13 conv) to gain capacity WITHOUT widening: peak memory is unchanged (still channels x 256^3, one buffer reused per layer); only parameter count (~+4 layers) and wall-clock (~+15-20%) grow. The densely spread odd rungs (3,5,7,13,19,31) fill the dilation spectrum to fight fragility rather than just extend reach. NO skip/residual connections (anti-U-Net): trainability of the deeper plain stack relies on per-channel GroupNorm in every block -- pair with model.use_affine=True. NOTE: deepest layer uses dilation 31 (padding 31), so train on cubes >= ~64 voxels for dilated layers to see real (not all-padding) context; the curriculum starts at 128.",
+  "bnorm": true,
+  "gelu": true,
+  "dropout_p": 0,
+  "layers": [
+    { "in_channels": -1, "out_channels": 5, "kernel_size": 3, "padding": 1,  "stride": 1, "dilation": 1 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 3,  "stride": 1, "dilation": 3 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 5,  "stride": 1, "dilation": 5 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 7,  "stride": 1, "dilation": 7 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 13, "stride": 1, "dilation": 13 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 19, "stride": 1, "dilation": 19 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 31, "stride": 1, "dilation": 31 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 19, "stride": 1, "dilation": 19 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 13, "stride": 1, "dilation": 13 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 7,  "stride": 1, "dilation": 7 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 5,  "stride": 1, "dilation": 5 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 3,  "stride": 1, "dilation": 3 },
+    { "in_channels": 5,  "out_channels": 5, "kernel_size": 3, "padding": 1,  "stride": 1, "dilation": 1 },
+    { "in_channels": 5,  "out_channels": -1, "kernel_size": 1, "padding": 0, "stride": 1, "dilation": 1 }
+  ]
+}

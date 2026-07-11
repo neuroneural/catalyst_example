@@ -1,0 +1,164 @@
+# =============================================================================
+# Fast, from-scratch training of ./modelAE_hdc_deep.json.
+#
+# Run (throughput-optimized entrypoint; this is its default config):
+#   source ~/venv/torch/bin/activate
+#   python curriculum_training_fast.py --config-name gn_hdc_deep --config-dir conf
+#
+# curriculum_training_fast.py reuses all of curriculum_training.py's logic and
+# layers GPU-efficiency on top (cuDNN autotune, TF32, channels_last_3d,
+# torch.compile applied AFTER the DDP wrap). This config supplies the
+# convergence knobs that matter for this model:
+#   * accum_steps + numvolumes -> larger effective batch at ~zero extra peak mem
+#   * amp_dtype: bfloat16       -> no GradScaler over/underflow stalls
+#   * single long OneCycle cycle with a short warmup (pct_start)
+#   * grad_clip + weight_decay  -> robust from random init, fp16-safe weights
+#
+# Before your first run set wandb.team/project and point mongo + the experiment
+# db/collection/labelfield at YOUR data source (values below are examples).
+#
+# The jdx: and distill: blocks are OPT-IN experiments, DISABLED by default
+# (we do not yet know whether they improve robustness). Leave them off for the
+# standard recipe; flip enabled: true to try them.
+# =============================================================================
+
+mongo:
+  host: "10.245.12.58"
+  host_slurm: "10.245.12.58"
+  dbname: "synth104"
+  collection: "read"
+  index_id: "id"
+  labelfield: "label"
+  datafield: "data"
+  validation_percent: 0.1
+
+wandb:
+  team: "neuroneural"        # <-- set to your team
+  project: "gn_hdc_deep"     # <-- set to your project
+
+bit16: True
+
+perf:
+  verbose: False
+  cudnn_benchmark: True
+  tf32: True
+  channels_last: True
+  compile: True
+  compile_mode: "default"
+  ddp_batch_sync: True
+  profile: False
+  profile_steps: 10
+  amp_dtype: "bfloat16"          # "float16" (old default) | "bfloat16"
+
+model:
+  n_classes: 3
+  model_channels: 6
+  model_label: "_gn_hdc_deep"
+  config_file: "./modelAE_hdc_deep.json"
+  volume_shape: [256, 256, 256]
+  maxshape: 300
+  optimize_inline: False
+  use_groupnorm: True
+  use_affine: True
+  use_me: False
+  use_se: False
+  use_checkpoint: False
+  checkpoint_segments: 2
+  checkpoint_keep_layers: 0
+  loss_weight: [0.5, 0.5]
+  label_smoothing: 0.01
+  dice_generalized: True
+  loss_fused: True
+  use_refiner: False
+  # EMA only swaps in for VALIDATION + the checkpoint save; it never touches the
+  # training curve. Judge it on macro_dice/valid, not train.
+  use_ema: False
+  ema_decay: 0.999
+
+  # ---------------------------------------------------------------------------
+  # OPT-IN: JDX channel-decorrelation pressure (jdx.py). Training-only auxiliary
+  # loss that pushes hidden-layer channels to encode distinct sources (use the
+  # full width). No extra peak memory; inference/export byte-identical.
+  # DISABLED by default -- effect on robustness is not yet established.
+  jdx:
+    enabled: false
+    mode: corr               # "corr" (recommended) | "ratio" (legacy A/B)
+    lambda: 0.02
+    num_batches: 4
+    subcube: 9
+    foreground: true
+    randomize_jdx: false
+    skip_last_layers: 2
+    warmup_steps: 2000
+
+  # ---------------------------------------------------------------------------
+  # OPT-IN: knowledge distillation from a stronger teacher (distill.py). Teacher
+  # runs train-time only (no_grad + eval); inference/export untouched.
+  # DISABLED by default -- effect on robustness is not yet established.
+  distill:
+    enabled: false
+    teacher_checkpoint: ""   # <-- path to teacher model.last.pth
+    teacher_channels: 16
+    teacher_classes: 18
+    teacher_config_file: "./modelAE_hdc_deep.json"
+    teacher_affine: true
+    temperature: 3.0
+    alpha: 0.5
+
+paths:
+  loadcheckpoint: False        # from scratch (random init). Set a path + True to resume.
+  model: "./logs/tmp/gn_hdc_deep/model.last.pth"
+  logdir: "./logs/tmp/gn_hdc_deep/"
+
+client_creator:
+  crop_tensor: False
+
+dataloader:
+  num_workers: 6
+  prefetch_factor: 4
+  valid_prefetch_factor: 2
+  # false = workers respawned each epoch (bounds glibc malloc creep, ~free since
+  # the run is compute-bound). Set true ONLY with the allocator tamed at launch
+  # (MALLOC_TRIM_THRESHOLD_=0 MALLOC_ARENA_MAX=2, or LD_PRELOAD jemalloc).
+  persistent_workers: false
+
+metrics:
+  dice_every_n_steps: 10
+  dice_subsample_stride: 4
+
+experiment:
+  # max_lr = 8 * lr_scale * numcubes * numvolumes / 256 (single rep).
+  # numvolumes=4 -> peak = lr_scale * 0.125; lr_scale 0.10 -> max_lr 0.0125.
+  lr_scale: 0.10
+  # Decoupled weight decay. >0 auto-switches Adam->AdamW and decays CONV WEIGHTS
+  # ONLY (GroupNorm gamma/beta + biases excluded). Keeps weights fp16-safe for
+  # WebGPU export. 0 to disable.
+  weight_decay: 1.0e-2
+  # Gradient clipping (total norm). Bounds an occasional outlier batch; a
+  # non-finite norm skips the step. 0 to disable.
+  grad_clip: 1.0
+  # pct_start = fraction of the WHOLE cycle spent warming up. From random init a
+  # slightly longer warmup is safer than for a resume.
+  pct_start: 0.05
+  accum_steps: 2                 # numvols 4 x GPUs x accum 2 = large effective batch.
+  maxreps: 1                     # single long run
+  cubesizes_code: |
+    [256] * maxreps
+  numcubes_code: |
+    [1] * maxreps
+  numvolumes_code: |
+    [4] * maxreps
+  weights_code: |
+    [1] * maxreps
+  databases_code: |
+    ["wirehead_mrn_gentle"] * maxreps   # <-- your db
+  collections_code: |
+    ["read"] * maxreps
+  dbfields_code: |
+    [("data", "label")] * maxreps
+  epochs_code: |
+    [150] * maxreps  # epochs is the main wall-clock lever (compute-bound).
+  prefetches_code: |
+    [24] * maxreps
+  attenuates_code: |
+    [0.8] * maxreps
