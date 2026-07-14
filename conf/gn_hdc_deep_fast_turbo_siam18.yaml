@@ -1,0 +1,143 @@
+# =============================================================================
+# gn_hdc_deep_fast.yaml + convergence-speed deltas (the model is capable; this
+# just helps it train faster/cleaner). Run:
+#   python curriculum_training_fast.py --config-name gn_hdc_deep_fast_turbo
+#
+# Deltas vs gn_hdc_deep_fast.yaml (everything else identical):
+#   1. accum_steps: 8          -> effective batch 8 at ZERO extra peak memory.
+#                                 Smooths the very noisy single-256^3-volume
+#                                 gradient; lets the LR run hotter/cleaner.
+#   2. perf.amp_dtype: bfloat16-> drop GradScaler over/underflow stalls; more
+#                                 stable for the tiny-channel GroupNorm grads.
+#   3. Single long LR cycle    -> maxreps=1, epochs=[150]. The fast config's
+#                                 10-rep "curriculum" was all cube 256 / 1 vol,
+#                                 i.e. pure OneCycle LR thrash with 0.8^rep peak
+#                                 attenuation. One long warmup+anneal at a tuned
+#                                 max_lr spends the whole budget climbing.
+#   4. use_ema: 0.999          -> validate + checkpoint on EMA weights; raises
+#                                 and smooths the effective curve, free at infer.
+# (AdamW deliberately NOT used -- negligible for a GroupNorm'd small CNN.)
+#
+# NOTE: keeps gn_hdc_deep_fast's data (MindfulTensors/MRN/label104). If your
+# improving run is the synth18 "read" collection, switch the mongo + experiment
+# db/collection/labelfield to synth18 / read / label18 (see gn_hdc_deep_sae.yaml).
+
+mongo:
+  # SynthSeg generator served via wirehead -> db "synth18", collection "read".
+  # (Pointing at MindfulTensors/MRN returns empty records -> mytransform "0 bytes".)
+  host: "10.245.12.58"
+  host_slurm: "10.245.12.58"   # wirehead/synth18 endpoint; verify if running under SLURM
+  dbname: "synth104"
+  collection: "read"
+  index_id: "id"
+  labelfield: "label"
+  datafield: "data"
+  validation_percent: 0.1
+
+wandb:
+  team: "neuroneural"
+  project: "synth18"
+
+bit16: True
+
+perf:
+  verbose: False
+  cudnn_benchmark: True
+  tf32: True
+  channels_last: True     # ON once compile works: GN is a fused triton kernel so NHWC
+                          # no longer thrashes the norm, and bf16 convs run NHWC on the
+                          # tensor cores (~600 ms/step of cuDNN layout conversions gone,
+                          # ~8% faster). Was a loss ONLY while compile was broken/eager.
+                          # NOTE: under multi-GPU DDP this yaml value only sets the
+                          # launcher; ranks read the FastRunner default (now True) /
+                          # the FAST_CHANNELS_LAST env var.
+  compile: True
+  compile_mode: "default"   # reduce-overhead gave 0 speedup (util already ~100%).
+                             # To try inductor conv-algo autotune: FAST_COMPILE_MODE=max-autotune
+  ddp_batch_sync: True
+  profile: False                 # one-shot torch.profiler. Enable per-run for DDP with
+  profile_steps: 10              # FAST_PROFILE=1 (yaml value doesn't reach mp.spawn ranks).
+  amp_dtype: "bfloat16"          # "float16" (old default) | "bfloat16"
+
+model:
+  n_classes: 18
+  model_channels: 16
+  model_label: "_gn_hdc_deep_16"
+  config_file: "./modelAE_hdc_deep.json"
+  volume_shape: [256, 256, 256]
+  maxshape: 300
+  optimize_inline: False
+  use_groupnorm: True
+  use_affine: True
+  use_me: False
+  use_se: False
+  use_checkpoint: False
+  checkpoint_segments: 2
+  checkpoint_keep_layers: 0
+  loss_weight: [0.5, 0.5]
+  label_smoothing: 0.01
+  dice_generalized: True
+  loss_fused: True
+  use_refiner: False
+  # EMA only swaps in for VALIDATION + the checkpoint save; it never touches the
+  # macro_dice_batch/train curve (training always uses raw weights). Off here to
+  # isolate the schedule fix; judge EMA on macro_dice/valid, not train.
+  use_ema: False
+  ema_decay: 0.999
+
+paths:
+  loadcheckpoint: true
+  model: "./logs/tmp/synth18_gn_hdc_deep_turbo16/model.last.pth"
+  logdir: "./logs/tmp/synth18_gn_hdc_deep_turbo16/"
+
+client_creator:
+  crop_tensor: False
+
+dataloader:
+  num_workers: 12
+  prefetch_factor: 4
+  valid_prefetch_factor: 2
+
+metrics:
+  dice_every_n_steps: 10
+  dice_subsample_stride: 4
+
+experiment:
+  # max_lr = 8 * lr_scale / 256 (single rep -> no 0.8^rep attenuation).
+  # lr_scale 0.15 -> max_lr ~= 0.0047 (vs the old run's productive ~0.0026). That
+  # peak is hot; with the warmup fix below it now ANNEALS instead of staying
+  # pinned, so 0.15 may be fine. If the curve stays noisy/flat, drop to 0.10
+  # (~0.0031) -- that isolates "hot LR" from "too-long warmup".
+  lr_scale: 0.1
+  # CRITICAL for a single long run: pct_start is the fraction of the WHOLE cycle
+  # spent warming up. At 0.1 over 150 epochs that's ~75k steps pinned at peak LR
+  # (the flat/noisy plateau you saw). 0.02 reaches peak fast, then anneals for
+  # the rest -- which is where dice actually climbs. (~15k-step warmup here.)
+  pct_start: 0.02
+  accum_steps: 8                 # was 1 (header intent was 8). Effective batch =
+                                 # numvolumes * accum_steps = 2 * 8 = 16 now.
+                                 # Memory-neutral; does NOT raise it/s or power.
+  maxreps: 1                     # single long run (was 10 reps of LR thrash)
+  cubesizes_code: |
+    [256] * maxreps
+  numcubes_code: |
+    [1] * maxreps
+  numvolumes_code: |
+    [1] * maxreps    # per-GPU batch 1 (~50/80 GB, safe). batch 2 fit (~78 GB) and was
+                     # only ~12% faster for near-OOM risk -- not worth it. accum_steps=8
+                     # still gives effective batch 8, memory-neutral. Bump to 2 only if
+                     # you want the last few % and can watch memory.
+  weights_code: |
+    [1] * maxreps
+  databases_code: |
+    ["wirehead_mrn_gentle"] * maxreps
+  collections_code: |
+    ["read"] * maxreps
+  dbfields_code: |
+    [("data", "label")] * maxreps
+  epochs_code: |
+    [50] * maxreps
+  prefetches_code: |
+    [24] * maxreps
+  attenuates_code: |
+    [0.8] * maxreps

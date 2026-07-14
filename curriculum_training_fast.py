@@ -76,13 +76,38 @@ def _strip_orig_mod_prefix(state_dict, prefix, local_metadata, strict,
 # Defaults; overwritten from cfg.perf / cfg.model in main() before any runner
 # is constructed. Kept as class attributes so they survive the per-rep
 # create/destroy cycle in base.main().
+#
+# CRITICAL: main() runs ONLY in the launcher, not in the mp.spawn DDP ranks (see
+# the module-scope note above re: TORCHINDUCTOR_COMPILE_THREADS). So a perf flag
+# set from cfg.perf in main() reaches the launcher but NOT the ranks -- the ranks
+# re-import this module and keep whatever these class defaults are. That silently
+# broke perf.profile and perf.compile_mode under multi-GPU DDP (the ranks, where
+# training + the profiler actually run, never saw the config value). Fix: seed
+# these defaults from env vars, which mp.spawn children DO inherit and which this
+# module re-reads on import in every rank. Under multi-GPU, prefer the env vars
+# below; cfg.perf still works for single-GPU (GPUEngine, no spawn).
+def _envflag(name, default):
+    v = os.environ.get(name)
+    return default if v is None else v not in ("0", "", "false", "False", "no", "No")
+
+
 class FastRunner(base.CustomRunner):
-    perf_channels_last = True
-    perf_compile = True
-    perf_compile_mode = "default"
-    perf_verbose = False
-    perf_profile = False
-    perf_profile_steps = 10
+    # Default ON -- but this depends on compile actually working (see
+    # _maybe_compile_model). History: with compile SILENTLY BROKEN under DDP,
+    # channels_last was a net loss (eager 3D GroupNorm has no NHWC kernel, so every
+    # norm converted layout fwd+bwd -> ~32% of time in copy/clone + the DDP
+    # grad-stride warning); off was ~17% faster then. Once compile was fixed, GN
+    # became a layout-agnostic fused triton kernel, so channels_last stopped
+    # thrashing the norm and instead lets the bf16 convs run NHWC natively on the
+    # tensor cores -- the ~600 ms/step of cuDNN nchwToNhwc/nhwcToNchw conversions
+    # disappear and convs get ~25% cheaper (~8% faster overall). Set
+    # FAST_CHANNELS_LAST=0 to A/B, or if you ever run with compile off.
+    perf_channels_last = _envflag("FAST_CHANNELS_LAST", True)
+    perf_compile = _envflag("FAST_COMPILE", True)
+    perf_compile_mode = os.environ.get("FAST_COMPILE_MODE", "default")
+    perf_verbose = _envflag("FAST_VERBOSE", False)
+    perf_profile = _envflag("FAST_PROFILE", False)
+    perf_profile_steps = int(os.environ.get("FAST_PROFILE_STEPS", "10"))
     checkpoint_segments = None
     checkpoint_keep_layers = 0
 
@@ -156,20 +181,32 @@ class FastRunner(base.CustomRunner):
                       file=sys.stderr, flush=True)
             return
         try:
-            # In-place compile (nn.Module.compile) rather than rebinding to
-            # torch.compile(...)'s OptimizedModule wrapper. Two reasons:
-            #  1) state_dict keys stay clean -- a wrapper prefixes every key with
-            #     "_orig_mod.", so Catalyst would save checkpoints that then fail
-            #     to load into a fresh (uncompiled) model on the next curriculum
-            #     rep ("Missing/Unexpected key(s) ... _orig_mod.*"). Clean keys
-            #     also matter for exporting weights to the browser model.
-            #  2) self.model stays the DDP module, so .no_sync()/.module still
-            #     work. Compiling the DDP module's forward still engages Dynamo's
-            #     DDPOptimizer.
-            self.model.compile(mode=self.perf_compile_mode)
+            # Compile the INNER module in place, NOT the DDP wrapper.
+            #
+            # History: this used to be self.model.compile() where self.model is the
+            # DistributedDataParallel wrapper, on the theory that compiling the DDP
+            # module engages Dynamo's DDPOptimizer (torch.compile(DDP(model))). In
+            # practice (this torch build) that produced ZERO fused kernels in
+            # training: Dynamo failed to trace DDP.forward and, because
+            # suppress_errors defaults True, silently fell back to eager -- no graph
+            # break, no exception, GroupNorm + convs all running as raw ATen kernels
+            # (GN alone was ~50% of GPU time). compile_probe.py confirmed the raw
+            # model compiles cleanly (1 graph, 0 breaks, 256 triton kernels), so the
+            # DDP wrapper was the sole culprit.
+            #
+            # Compiling self.model.module gives DDP(compile(model)): full inductor
+            # fusion of the conv->GroupNorm->GELU chains. We lose DDPOptimizer's
+            # comm/compute overlap, which is a minor cost for this compute-bound
+            # tiny model. In-place nn.Module.compile keeps state_dict keys clean (no
+            # "_orig_mod." prefix -> checkpoints stay portable / browser-exportable)
+            # and leaves self.model as the DDP module, so .no_sync()/.module (used by
+            # gradient accumulation) still work. On single-GPU (GPUEngine, no DDP)
+            # self.model has no .module, so this compiles self.model directly.
+            target = getattr(self.model, "module", self.model)
+            target.compile(mode=self.perf_compile_mode)
             if self.perf_verbose:
                 print(f"[fast] in-place compile(mode={self.perf_compile_mode}) "
-                      f"on {self.model.__class__.__name__} (post-DDP)",
+                      f"on {target.__class__.__name__} (inner module, DDP outside)",
                       file=sys.stderr, flush=True)
         except Exception as exc:  # pragma: no cover
             print(f"[fast] torch.compile failed, running eager: {exc}",
