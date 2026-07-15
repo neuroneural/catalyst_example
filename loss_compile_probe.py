@@ -26,12 +26,29 @@ DT = torch.bfloat16                             # matches amp_dtype
 
 torch.manual_seed(0)
 
+# BOUNDARY=1 to probe the Kervadec boundary term (siam18_boundary.yaml); the
+# extra cost is ~2*radius max_pool3d rings per foreground class, all no_grad.
+BOUNDARY = os.environ.get("BOUNDARY", "0") == "1"
+BW = float(os.environ.get("BOUNDARY_WEIGHT", "0.10"))
+BR = int(os.environ.get("BOUNDARY_RADIUS", "8"))
+BDS = int(os.environ.get("BOUNDARY_DS", "2"))   # phi downsample factor (1 = exact)
+
+# CLDICE=1 to probe the clDice topology term; CLDICE_ITERS / CLDICE_DS tune it.
+CLDICE = os.environ.get("CLDICE", "0") == "1"
+CW = float(os.environ.get("CLDICE_WEIGHT", "0.10"))
+CIT = int(os.environ.get("CLDICE_ITERS", "5"))
+CDS = int(os.environ.get("CLDICE_DS", "1"))
+
 def make_loss():
     # same construction as get_criterion: class_weight = [off_brain] + 1.0*...,
-    # generalized Dice, label_smoothing 0.01, 0.5/0.5 CE/Dice split.
+    # generalized Dice, label_smoothing 0.0 (new base), 0.5/0.5 CE/Dice split.
     cw = torch.tensor([0.2] + [1.0] * (C - 1), device=DEV)
     return CEDiceLoss(loss_weight=(0.5, 0.5), class_weight=cw,
-                      label_smoothing=0.01, generalized=True).to(DEV)
+                      label_smoothing=0.0, generalized=True,
+                      boundary_weight=(BW if BOUNDARY else 0.0),
+                      boundary_radius=BR, boundary_downsample=BDS,
+                      cldice_weight=(CW if CLDICE else 0.0),
+                      cldice_iters=CIT, cldice_downsample=CDS).to(DEV)
 
 logits = torch.randn(1, C, CUBE, CUBE, CUBE, device=DEV, dtype=DT)
 labels = torch.randint(0, C, (1, CUBE, CUBE, CUBE), device=DEV)
@@ -54,7 +71,9 @@ crit_c.compile(mode="default")
 for _ in range(3):                              # first call triggers compile
     lc, gc = run(crit_c, logits)
 
-print(f"cube={CUBE}  dtype={DT}")
+print(f"cube={CUBE}  dtype={DT}  "
+      f"boundary={'on w=%g r=%d ds=%d' % (BW, BR, BDS) if BOUNDARY else 'off'}  "
+      f"cldice={'on w=%g it=%d ds=%d' % (CW, CIT, CDS) if CLDICE else 'off'}")
 print(f"eager    loss = {le:.6f}")
 print(f"compiled loss = {lc:.6f}")
 print(f"loss |diff|   = {abs(le - lc):.3e}   (rel {abs(le-lc)/max(abs(le),1e-9):.2e})")

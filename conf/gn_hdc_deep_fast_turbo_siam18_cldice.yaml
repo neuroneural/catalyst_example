@@ -1,7 +1,23 @@
 # =============================================================================
+# clDICE TOPOLOGY variant. IDENTICAL to gn_hdc_deep_fast_turbo_siam18_ctrl.yaml
+# EXCEPT the clDice term is ON (model.cldice_weight below); boundary term OFF.
+# Shares the SAME ctrl and the SAME frozen start.pth as the boundary A/B, its
+# own logdir, so its effect is isolated. Freeze the shared start once:
+#   mkdir -p /data/users4/splis/data/segmentation/synth18_boundary_ab
+#   cp ./logs/tmp/synth18_gn_hdc_deep_turbo16/model.last.pth \
+#      /data/users4/splis/data/segmentation/synth18_boundary_ab/start.pth
+# Run (or use train_siam_ab.sbatch): python curriculum_training_fast.py \
+#      --config-dir=conf --config-name=gn_hdc_deep_fast_turbo_siam18_cldice
+#
+# Loss = 0.5*CE + 0.5*generalizedDice + cldice_weight*clDice.
+# clDice (dice.py: cldice_loss_from_probs) rewards the predicted foreground's
+# soft SKELETON lying inside the GT and vice-versa -> preserves CONNECTIVITY of
+# thin structures (sulci, thin cerebellar/gyral WM) that volumetric Dice ignores.
+# Train-only: inference / WebGPU export are byte-identical to the deploy model.
+# Probed cost @ds=1,it=5: ~0.62 s/step compiled (per-class gradient-checkpointed).
+# -----------------------------------------------------------------------------
 # gn_hdc_deep_fast.yaml + convergence-speed deltas (the model is capable; this
-# just helps it train faster/cleaner). Run:
-#   python curriculum_training_fast.py --config-name gn_hdc_deep_fast_turbo
+# just helps it train faster/cleaner).
 #
 # Deltas vs gn_hdc_deep_fast.yaml (everything else identical):
 #   1. accum_steps: 8          -> effective batch 8 at ZERO extra peak memory.
@@ -81,6 +97,22 @@ model:
   label_smoothing: 0.0
   dice_generalized: True
   loss_fused: True
+  # -------------------------------------------------------------------------
+  # clDice topology loss (train-only; 0.0 == control). Added to CE+Dice:
+  #   loss += cldice_weight * (1 - harmonic_mean(Tprec, Tsens))
+  # where Tprec/Tsens measure how much the predicted/GT soft-SKELETON lies inside
+  # the other's mask. Rewards preserving connectivity of thin structures. Built
+  # per-class and GRADIENT-CHECKPOINTED (the predicted skeleton is in the grad
+  # path; without checkpointing the full-res 17-class tape OOMs an 80GB GPU).
+  # Inference/export untouched. Boundary term OFF here (isolated A/B arm).
+  boundary_weight: 0.0
+  cldice_weight: 0.10          # start small; watch surface/valid + macro_dice.
+  cldice_iters: 5              # soft-skeleton iterations. 3 is the cheaper knob
+                               # (~0.67x cost) and costs less fine detail than ds=2.
+  cldice_downsample: 1         # 1 = full-res skeleton (preserves thin structure --
+                               # the POINT of clDice). 2 halves cost but coarsens
+                               # exactly the sulci/thin-WM it exists to protect.
+  cldice_include_bg: false     # skeletonize foreground classes only.
   use_refiner: False
   # EMA only swaps in for VALIDATION + the checkpoint save; it never touches the
   # macro_dice_batch/train curve (training always uses raw weights). Off here to
@@ -90,8 +122,9 @@ model:
 
 paths:
   loadcheckpoint: true
-  model: "./logs/tmp/synth18_gn_hdc_deep_turbo16/model.last.pth"
-  logdir: "./logs/tmp/synth18_gn_hdc_deep_turbo16/"
+  # Shared FROZEN start (see header) -- SAME file the control loads.
+  model: "/data/users4/splis/data/segmentation/synth18_boundary_ab/start.pth"
+  logdir: "/data/users4/splis/data/segmentation/synth18_boundary_ab/cldice/"
 
 client_creator:
   crop_tensor: False
@@ -110,6 +143,25 @@ dataloader:
 metrics:
   dice_every_n_steps: 10
   dice_subsample_stride: 4
+
+# Real-data validation: eval on real MindfulTensors/MRN (T1 + labelfused) instead
+# of a slice of the synth train loader, and compute boundary metrics that Dice
+# can't see. Omit this block (or surface_metrics: false) for legacy synth valid.
+validation:
+  # NOTE: per this file's mongo note, MindfulTensors/MRN is NOT on the wirehead/
+  # synth host -- set `host` to the MRN mongo host (leave commented to reuse the
+  # training host, which will error "no ids" if MRN isn't there).
+  db: "MindfulTensors"
+  collection: "MRN"
+  datafield: "T1"
+  labelfield: "labelfused"    # already 18-class; values >=18 clamped to 0 (bg)
+  # host: "10.xxx.xxx.xxx"
+  num_subjects: 64            # per-epoch eval size; raise (e.g. 300) for a final run
+  surface_metrics: true       # NSD@tau + HD95 + per-class/worst Dice (scipy, CPU)
+  surface_every_n_epochs: 5   # expensive (CPU) -> every 5 epochs, not every one
+  nsd_tau: 1.0                # mm tolerance for Surface Dice
+  spacing: [1.0, 1.0, 1.0]    # conformed 1mm isotropic
+  fail_dice: 0.5              # per-subject failure threshold (tail/fragility)
 
 experiment:
   # max_lr = 8 * lr_scale / 256 (single rep -> no 0.8^rep attenuation).

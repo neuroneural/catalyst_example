@@ -16,6 +16,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
 from dice import faster_dice, DiceLoss, CEDiceLoss
+from surface_metrics import all_class_metrics
 from meshnet import enMesh_checkpoint, enMesh, enMesh_checkpoint_SE, enMesh_SE
 from meshnet_gn import enMesh_checkpoint as enMesh_checkpoint_gn, SpatialAEMeshNet
 from meshnetme import MeshNetME_checkpoint
@@ -274,6 +275,16 @@ class CustomRunner(dl.Runner):
         label_smoothing=0.01,
         dice_generalized=False,
         loss_fused=False,
+        boundary_weight=0.0,
+        boundary_radius=8,
+        boundary_include_bg=False,
+        boundary_downsample=2,
+        cldice_weight=0.0,
+        cldice_iters=5,
+        cldice_downsample=1,
+        cldice_include_bg=False,
+        ce_class_weight_overrides=None,
+        valid_cfg=None,
         maxshape=300,
         hparams=None,
         use_refiner=False,
@@ -349,6 +360,18 @@ class CustomRunner(dl.Runner):
         self.label_smoothing = label_smoothing
         self.dice_generalized = dice_generalized
         self.loss_fused = loss_fused
+        self.boundary_weight = float(boundary_weight)
+        self.boundary_radius = int(boundary_radius)
+        self.boundary_include_bg = bool(boundary_include_bg)
+        self.boundary_downsample = int(boundary_downsample)
+        self.cldice_weight = float(cldice_weight)
+        self.cldice_iters = int(cldice_iters)
+        self.cldice_downsample = int(cldice_downsample)
+        self.cldice_include_bg = bool(cldice_include_bg)
+        self.ce_class_weight_overrides = dict(ce_class_weight_overrides or {})
+        # Optional separate validation source + surface metrics (e.g. real MRN).
+        # Empty dict => legacy behavior (validate on synth range(32), dice only).
+        self.valid_cfg = dict(valid_cfg or {})
         self.meshnetme = meshnetme
         self.wandb_team = wandb_team
         self.maxshape = maxshape
@@ -639,10 +662,21 @@ class CustomRunner(dl.Runner):
 
     def get_engine(self):
         if torch.cuda.device_count() > 1:
-            return dl.DistributedDataParallelEngine(
-                # mixed_precision="fp16",
-                process_group_kwargs={"backend": "nccl"},
-            )
+            # Unique DDP rendezvous port per SLURM job so concurrent DDP runs on
+            # ONE node don't both grab Catalyst's default 2112 (EADDRINUSE). All
+            # ranks of a job share SLURM_JOB_ID -> same port; different jobs differ.
+            jid = int(os.environ.get("SLURM_JOB_ID", "0") or "0")
+            port = 20000 + (jid % 20000)
+            os.environ["MASTER_PORT"] = str(port)   # for the env-reading code path
+            try:
+                return dl.DistributedDataParallelEngine(
+                    port=port,
+                    process_group_kwargs={"backend": "nccl"},
+                )
+            except TypeError:                        # older Catalyst without `port`
+                return dl.DistributedDataParallelEngine(
+                    process_group_kwargs={"backend": "nccl"},
+                )
         else:
             return dl.GPUEngine()
 
@@ -776,22 +810,60 @@ class CustomRunner(dl.Runner):
             num_prefetches=self.prefetches,
         )
 
-        vdataset = MongoheadDataset(
-            range(32),
-            self.funcs["mytransform"],
-            None,
-            self.db_fields,
-            normalize=unit_interval_normalize,
-            id=self.index_id,
-        )
-
-        vsampler = (
-            DBBatchSampler(vdataset, batch_size=self.num_volumes, seed=SEED)
-            if self.engine.is_ddp
-            else DBBatchSampler(
-                vdataset, batch_size=self.num_volumes, seed=SEED
+        # Validation source. Default: same DB as train, range(32) (legacy). If a
+        # `validation.db` override is configured (e.g. real MindfulTensors/MRN
+        # with T1 + labelfused), build a DEDICATED client/dataset for it so the
+        # eval reflects real-data quality, not the synth train distribution.
+        vc = self.valid_cfg
+        if vc.get("db"):
+            v_host = vc.get("host", self.db_host)
+            v_db = vc["db"]
+            v_col = vc["collection"]
+            v_fields = (vc.get("datafield", "T1"), vc.get("labelfield", "labelfused"))
+            v_n = int(vc.get("num_subjects", 32))
+            self.v_client_creator = ClientCreator(
+                v_host, volume_shape=self.client_creator.volume_shape
             )
-        )
+            self.v_client_creator.set_database(v_db)
+            self.v_client_creator.set_collection(v_col)
+            self.v_client_creator.set_shape([256, 256, 256])
+            self.v_client_creator.set_num_subcubes(1)
+            # MRN/HCP ids are sparse/non-zero-based -> enumerate the ids that
+            # actually exist (prefer <col>.meta, fall back to <col>.bin), else
+            # empty records come back as "mytransform 0 bytes". Cap at v_n.
+            _c = MongoClient("mongodb://" + v_host + ":27017")
+            try:
+                v_ids = sorted(int(x) for x in _c[v_db][f"{v_col}.meta"].distinct(self.index_id))
+            except Exception:
+                v_ids = []
+            if not v_ids:
+                v_ids = sorted(int(x) for x in _c[v_db][f"{v_col}.bin"].distinct(self.index_id))
+            _c.close()
+            if not v_ids:
+                raise SystemExit(f"[valid] no ids in {v_db}/{v_col}")
+            v_ids = v_ids[:v_n]
+            print(f"[valid] real-data eval: {v_db}/{v_col} fields={v_fields} "
+                  f"n={len(v_ids)} (ids {v_ids[0]}..{v_ids[-1]})",
+                  file=sys.stderr, flush=True)
+            vdataset = MongoheadDataset(
+                v_ids, self.v_client_creator.mytransform, None, v_fields,
+                normalize=unit_interval_normalize, id=self.index_id,
+            )
+            v_worker_init = self.v_client_creator.create_client
+            v_collate = self.v_client_creator.mycollate_full
+        else:
+            vdataset = MongoheadDataset(
+                range(32),
+                self.funcs["mytransform"],
+                None,
+                self.db_fields,
+                normalize=unit_interval_normalize,
+                id=self.index_id,
+            )
+            v_worker_init = self.funcs["createclient"]
+            v_collate = self.collate
+
+        vsampler = DBBatchSampler(vdataset, batch_size=self.num_volumes, seed=SEED)
 
         # Validation is a tiny set (range(32), ~1 iter/epoch). With
         # persistent_workers=True it would keep a SECOND full worker pool
@@ -804,9 +876,9 @@ class CustomRunner(dl.Runner):
             DataLoader(
                 vdataset,
                 sampler=vsampler,
-                collate_fn=self.collate,
+                collate_fn=v_collate,
                 pin_memory=True,
-                worker_init_fn=self.funcs["createclient"],
+                worker_init_fn=v_worker_init,
                 persistent_workers=False,
                 prefetch_factor=self.valid_prefetch_factor,
                 num_workers=valid_workers,
@@ -950,21 +1022,67 @@ class CustomRunner(dl.Runner):
         return model
 
     def get_criterion(self):
-        class_weight = torch.FloatTensor(
-            [self.off_brain_weight] + [1.0] * (self.n_classes - 1)
-        ).to(self.engine.device)
+        cw = [self.off_brain_weight] + [1.0] * (self.n_classes - 1)
+        # Per-class CE upweighting for hard/small structures (CE term only; the
+        # generalized-Dice term keeps its own inverse-volume weighting). Maps
+        # class_index -> multiplier, e.g. {4: 3.0, 5: 2.0, 12: 2.0}. Default {} =
+        # uniform. Only the CE gradient is reweighted, so the deployed model and
+        # its memory are unchanged.
+        overrides = getattr(self, "ce_class_weight_overrides", None) or {}
+        for k, v in overrides.items():
+            ki = int(k)
+            if 0 <= ki < self.n_classes:
+                cw[ki] = float(v)
+        if overrides:
+            print(f"[loss] CE class-weight overrides: {overrides}",
+                  file=sys.stderr, flush=True)
+        class_weight = torch.FloatTensor(cw).to(self.engine.device)
         label_smoothing = getattr(self, "label_smoothing", 0.01)
         generalized = getattr(self, "dice_generalized", False)
 
+        boundary_weight = float(getattr(self, "boundary_weight", 0.0))
+        boundary_radius = int(getattr(self, "boundary_radius", 8))
+        boundary_include_bg = bool(getattr(self, "boundary_include_bg", False))
+        boundary_downsample = int(getattr(self, "boundary_downsample", 2))
+        cldice_weight = float(getattr(self, "cldice_weight", 0.0))
+        cldice_iters = int(getattr(self, "cldice_iters", 5))
+        cldice_downsample = int(getattr(self, "cldice_downsample", 1))
+        cldice_include_bg = bool(getattr(self, "cldice_include_bg", False))
+
         # Fused path: one log_softmax shared by CE and Dice (saves a full
         # softmax volume at 104 classes / 256^3). Opt-in via cfg.model.loss_fused.
+        # The Kervadec boundary term (boundary_weight>0) also reuses that softmax.
         if getattr(self, "loss_fused", False):
+            if boundary_weight > 0:
+                print(f"[loss] Kervadec boundary term ON: weight={boundary_weight} "
+                      f"radius={boundary_radius} include_bg={boundary_include_bg} "
+                      f"downsample={boundary_downsample}",
+                      file=sys.stderr, flush=True)
+            if cldice_weight > 0:
+                print(f"[loss] clDice topology term ON: weight={cldice_weight} "
+                      f"iters={cldice_iters} downsample={cldice_downsample} "
+                      f"include_bg={cldice_include_bg}",
+                      file=sys.stderr, flush=True)
             return CEDiceLoss(
                 loss_weight=tuple(self.loss_weight),
                 class_weight=class_weight,
                 label_smoothing=label_smoothing,
                 generalized=generalized,
+                boundary_weight=boundary_weight,
+                boundary_radius=boundary_radius,
+                boundary_include_bg=boundary_include_bg,
+                boundary_downsample=boundary_downsample,
+                cldice_weight=cldice_weight,
+                cldice_iters=cldice_iters,
+                cldice_downsample=cldice_downsample,
+                cldice_include_bg=cldice_include_bg,
             ).to(self.engine.device)
+
+        if boundary_weight > 0 or cldice_weight > 0:
+            raise ValueError(
+                "boundary_weight/cldice_weight>0 require model.loss_fused=True "
+                "(both are implemented in the fused CEDiceLoss path)."
+            )
 
         ce_criterion = torch.nn.CrossEntropyLoss(
             weight=class_weight, label_smoothing=label_smoothing
@@ -1098,12 +1216,152 @@ class CustomRunner(dl.Runner):
             "tqdm": dl.TqdmCallback(),
         }
 
+    # ---- validation surface metrics (NSD@tau, HD95, per-class/worst Dice) ----
+    def _surface_enabled(self):
+        return bool(self.valid_cfg.get("surface_metrics", False))
+
+    def _reset_surface_acc(self):
+        self._surf = {
+            c: {"dice": [], "nsd": [], "hd95": [], "assd": [], "miss": 0}
+            for c in range(1, self.n_classes)
+        }
+        self._surf_subj = []          # per-subject mean foreground Dice
+
+    def _accumulate_surface(self, pred_t, label_t):
+        """pred_t: [.,D,H,W] argmax; label_t: [.,(1),D,H,W] int GT. Runs on CPU
+        (scipy), guarded so an eval hiccup never kills training."""
+        try:
+            tau = float(self.valid_cfg.get("nsd_tau", 1.0))
+            spacing = tuple(float(x) for x in self.valid_cfg.get("spacing", [1.0, 1.0, 1.0]))
+            fail_dice = float(self.valid_cfg.get("fail_dice", 0.5))
+            pred = pred_t.reshape((-1,) + tuple(pred_t.shape[-3:])).to(torch.int16).cpu().numpy()
+            gt = label_t.reshape((-1,) + tuple(label_t.shape[-3:])).to(torch.int64)
+            gt = torch.where(gt < self.n_classes, gt, torch.zeros_like(gt))  # first-18 clamp
+            gt = gt.to(torch.int16).cpu().numpy()
+            for b in range(pred.shape[0]):
+                per = all_class_metrics(gt[b], pred[b], self.n_classes,
+                                        spacing=spacing, tau=tau)
+                fg = []
+                for c, r in per.items():
+                    if r["status"] in ("ok", "empty_pred"):     # GT present
+                        self._surf[c]["dice"].append(r["dice"])
+                        self._surf[c]["nsd"].append(r["nsd"])
+                        self._surf[c]["assd"].append(r["assd"])
+                        if r["status"] == "empty_pred":
+                            self._surf[c]["miss"] += 1
+                        else:
+                            self._surf[c]["hd95"].append(r["hd95"])
+                        fg.append(r["dice"])
+                if fg:
+                    self._surf_subj.append(float(np.mean(fg)))
+        except Exception as exc:
+            print(f"[valid-surface] skipped a batch: {exc}", file=sys.stderr, flush=True)
+
+    def _finalize_surface_metrics(self, runner):
+        """Aggregate per-class + tail, DDP all-reduce, log to wandb + stderr."""
+        import numpy as _np
+        C = self.n_classes
+        dev = getattr(self.engine, "device", "cpu")
+        # per-class sums/counts as tensors for a single all_reduce each
+        sum_dice = torch.zeros(C, device=dev); cnt = torch.zeros(C, device=dev)
+        sum_nsd = torch.zeros(C, device=dev)
+        sum_hd = torch.zeros(C, device=dev); cnt_hd = torch.zeros(C, device=dev)
+        miss = torch.zeros(C, device=dev)
+        min_dice = torch.full((C,), float("inf"), device=dev)
+        max_hd = torch.full((C,), float("-inf"), device=dev)
+        for c in range(1, C):
+            d = self._surf[c]
+            if d["dice"]:
+                sum_dice[c] = float(_np.sum(d["dice"])); cnt[c] = len(d["dice"])
+                sum_nsd[c] = float(_np.sum(d["nsd"]))
+                min_dice[c] = float(_np.min(d["dice"]))
+            if d["hd95"]:
+                sum_hd[c] = float(_np.sum(d["hd95"])); cnt_hd[c] = len(d["hd95"])
+                max_hd[c] = float(_np.max(d["hd95"]))
+            miss[c] = d["miss"]
+        fail_dice = float(self.valid_cfg.get("fail_dice", 0.5))
+        subj = self._surf_subj
+        n_subj = torch.tensor(float(len(subj)), device=dev)
+        n_fail = torch.tensor(float(sum(1 for s in subj if s < fail_dice)), device=dev)
+        worst = torch.tensor(min(subj) if subj else float("inf"), device=dev)
+
+        if self.engine.is_ddp:
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    for t in (sum_dice, cnt, sum_nsd, sum_hd, cnt_hd, miss, n_subj, n_fail):
+                        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(min_dice, op=dist.ReduceOp.MIN)
+                    dist.all_reduce(max_hd, op=dist.ReduceOp.MAX)
+                    dist.all_reduce(worst, op=dist.ReduceOp.MIN)
+            except Exception as exc:
+                print(f"[valid-surface] all_reduce skipped: {exc}", file=sys.stderr, flush=True)
+
+        rows = []
+        for c in range(1, C):
+            n = int(cnt[c].item()); nh = int(cnt_hd[c].item())
+            rows.append((c, n, int(miss[c].item()),
+                         (sum_dice[c].item() / n) if n else float("nan"),
+                         (min_dice[c].item() if n else float("nan")),
+                         (sum_nsd[c].item() / n) if n else float("nan"),
+                         (sum_hd[c].item() / nh) if nh else float("nan"),
+                         (max_hd[c].item() if nh else float("nan"))))
+        macro_dice = _np.nanmean([r[3] for r in rows]) if rows else float("nan")
+        macro_nsd = _np.nanmean([r[5] for r in rows]) if rows else float("nan")
+        macro_hd = _np.nanmean([r[6] for r in rows]) if rows else float("nan")
+        nsubj = int(n_subj.item()); nfail = int(n_fail.item())
+        worst_v = worst.item()
+        fail_rate = nfail / max(1, nsubj)
+
+        print("\n[valid-surface] per-class (Dice / minDice / NSD@%.1fmm / HD95 / HD95max):"
+              % float(self.valid_cfg.get("nsd_tau", 1.0)), file=sys.stderr, flush=True)
+        for (c, n, m, dm, dmin, nsd, hd, hdmx) in rows:
+            print(f"  cls {c:2d} n={n:3d} miss={m:2d}  dice={dm:.3f} min={dmin:.3f}  "
+                  f"nsd={nsd:.3f}  hd95={hd:.2f} max={hdmx:.2f}", file=sys.stderr, flush=True)
+        print(f"[valid-surface] MACRO dice={macro_dice:.4f} nsd={macro_nsd:.4f} "
+              f"hd95={macro_hd:.2f}mm | worst-subj={worst_v:.4f} "
+              f"fail(<{fail_dice})={fail_rate:.3f} ({nfail}/{nsubj})",
+              file=sys.stderr, flush=True)
+
+        self.loader_metrics["surf_macro_dice"] = macro_dice
+        self.loader_metrics["surf_macro_nsd"] = macro_nsd
+        self.loader_metrics["surf_macro_hd95"] = macro_hd
+        self.loader_metrics["surf_worst_subject_dice"] = worst_v
+        try:
+            import wandb
+            if wandb.run is not None:
+                payload = {"surface/valid/macro_dice": macro_dice,
+                           "surface/valid/macro_nsd": macro_nsd,
+                           "surface/valid/macro_hd95": macro_hd,
+                           "surface/valid/worst_subject_dice": worst_v,
+                           "surface/valid/failure_rate": fail_rate}
+                for (c, n, m, dm, dmin, nsd, hd, hdmx) in rows:
+                    payload[f"surface/valid/dice_c{c}"] = dm
+                    payload[f"surface/valid/nsd_c{c}"] = nsd
+                    payload[f"surface/valid/hd95_c{c}"] = hd
+                wandb.log(payload, commit=False)
+        except Exception:
+            pass
+
     def on_loader_start(self, runner):
         """
         Calls runner methods when the dataloader begins and adds
         metrics for loss and macro_dice
         """
         super().on_loader_start(runner)
+        # Surface metrics are CPU/scipy and cost minutes per pass -> only run them
+        # every `surface_every_n_epochs` (Dice stays on GPU, logged every epoch).
+        self._surf_this_epoch = False
+        if getattr(runner, "loader_key", "") == "valid" and self._surface_enabled():
+            # Count validation passes ourselves (robust to Catalyst version's
+            # epoch-attribute naming). Fire on the FIRST pass, then every N.
+            self._valid_pass = getattr(self, "_valid_pass", 0) + 1
+            every = int(self.valid_cfg.get("surface_every_n_epochs", 1))
+            self._surf_this_epoch = (
+                self._valid_pass == 1 or every <= 1 or self._valid_pass % every == 0
+            )
+            if self._surf_this_epoch:
+                self._reset_surface_acc()
         keys = ["loss", "macro_dice", "learning rate"]
         if getattr(self, "use_refiner", False):
             keys += ["refiner_iters_mean", "refiner_iters_min", "refiner_iters_max", "refiner_iters_relative_mean", "refiner_residual_mean", "refiner_residual_min", "refiner_residual_max", "refiner_avg_kernel_delta", "refiner_avg_alpha", "refiner_coeff_abs_mean", "refiner_coeff_abs_max", "refiner_delta_penalty", "refiner_scheduled_blend", "refiner_effective_blend", "refiner_bypassed", "refiner_bypass_prob", "refiner_base_loss", "refiner_base_loss_weighted"]
@@ -1165,6 +1423,8 @@ class CustomRunner(dl.Runner):
                     )
             except Exception:
                 pass
+        if loader_key == "valid" and getattr(self, "_surf_this_epoch", False) and hasattr(self, "_surf"):
+            self._finalize_surface_metrics(runner)
         # Per-epoch cleanup insurance against host-RAM creep: force a GC sweep so
         # any dropped-but-uncollected loader/prefetch references (and their pinned
         # buffers) are freed at the loader boundary. NOTE: do NOT empty_cache() here
@@ -1257,6 +1517,13 @@ class CustomRunner(dl.Runner):
             torch.cuda.synchronize()
 
         sample, label = batch
+        # Real validation labels (e.g. MRN `labelfused`) can carry class indices
+        # >= n_classes. CE gather / class_weight[targets] / dice would then index
+        # the 18-wide class dim out of bounds -> CUDA device-side assert. Clamp
+        # the OOR labels to 0 (background) = the "first n_classes" scheme. Guarded
+        # to the validation override only, so synth training labels are untouched.
+        if (not self.model.training) and self.valid_cfg.get("db"):
+            label = torch.where(label < self.n_classes, label, torch.zeros_like(label))
         refiner_delta_penalty = torch.zeros((), device=sample.device)
         refiner_base_loss = torch.zeros((), device=sample.device)
         scheduled_blend = 0.0 if getattr(self, "_refiner_frozen", False) else self.refiner_blend
@@ -1456,6 +1723,8 @@ class CustomRunner(dl.Runner):
                 )
             self._last_dice = dice.detach()
             approx_dice = dice.detach()  # full dice IS the approx on compute steps
+            if (not is_train) and self._surface_enabled() and getattr(self, "_surf_this_epoch", False):
+                self._accumulate_surface(result, labels)
         else:
             dice = self._last_dice
             # Cheap approximate dice on a strided spatial subsample.
@@ -1773,6 +2042,18 @@ def main(cfg: DictConfig):
     label_smoothing = cfg.model.get("label_smoothing", 0.01)
     dice_generalized = cfg.model.get("dice_generalized", False)
     loss_fused = cfg.model.get("loss_fused", False)
+    boundary_weight = float(cfg.model.get("boundary_weight", 0.0))
+    boundary_radius = int(cfg.model.get("boundary_radius", 8))
+    boundary_include_bg = bool(cfg.model.get("boundary_include_bg", False))
+    boundary_downsample = int(cfg.model.get("boundary_downsample", 2))
+    cldice_weight = float(cfg.model.get("cldice_weight", 0.0))
+    cldice_iters = int(cfg.model.get("cldice_iters", 5))
+    cldice_downsample = int(cfg.model.get("cldice_downsample", 1))
+    cldice_include_bg = bool(cfg.model.get("cldice_include_bg", False))
+    _cw = cfg.model.get("ce_class_weight_overrides", None)
+    ce_class_weight_overrides = OmegaConf.to_container(_cw, resolve=True) if _cw is not None else {}
+    _vc = cfg.get("validation", None)
+    valid_cfg = OmegaConf.to_container(_vc, resolve=True) if _vc is not None else {}
     model_path = cfg.paths.model if cfg.paths.loadcheckpoint else ""
     logdir = cfg.paths.logdir
     db_host = cfg.mongo.host_slurm if os.environ.get("SLURM_JOB_ID") else cfg.mongo.host
@@ -1845,8 +2126,14 @@ def main(cfg: DictConfig):
             * numvolumes[experiment]
             / 256
         )
+        # Distinguishing tag so sibling A/B runs aren't all named identically in
+        # wandb. Default = logdir basename (ctrl / boundary / cldice / ceweight),
+        # override with wandb.run_tag in the yaml.
+        _run_tag = (cfg.wandb.get("run_tag", None)
+                    or os.path.basename(os.path.normpath(logdir)))
         wandb_experiment = (
-            f"{start_experiment + experiment:02} cube "
+            f"{_run_tag} | "
+            + f"{start_experiment + experiment:02} cube "
             + str(subvolume_shape[0])
             + " "
             + collections[experiment]
@@ -1901,6 +2188,16 @@ def main(cfg: DictConfig):
             label_smoothing=label_smoothing,
             dice_generalized=dice_generalized,
             loss_fused=loss_fused,
+            boundary_weight=boundary_weight,
+            boundary_radius=boundary_radius,
+            boundary_include_bg=boundary_include_bg,
+            boundary_downsample=boundary_downsample,
+            cldice_weight=cldice_weight,
+            cldice_iters=cldice_iters,
+            cldice_downsample=cldice_downsample,
+            cldice_include_bg=cldice_include_bg,
+            ce_class_weight_overrides=ce_class_weight_overrides,
+            valid_cfg=valid_cfg,
             meshnetme=cfg.model.use_me,
             db_host=db_host,
             wandb_team=cfg.wandb.team,

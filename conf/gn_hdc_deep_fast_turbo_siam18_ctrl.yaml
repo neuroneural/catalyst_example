@@ -1,7 +1,17 @@
 # =============================================================================
+# A/B CONTROL for the Kervadec boundary-loss experiment. IDENTICAL to
+# gn_hdc_deep_fast_turbo_siam18_boundary.yaml EXCEPT boundary_weight is OFF here.
+# Both resume from the SAME frozen checkpoint (paths.model below) and write to
+# their own logdir, so any macro_dice/quality delta is attributable to the
+# boundary term alone. Freeze the shared start once:
+#   mkdir -p /data/users4/splis/data/segmentation/synth18_boundary_ab
+#   cp ./logs/tmp/synth18_gn_hdc_deep_turbo16/model.last.pth \
+#      /data/users4/splis/data/segmentation/synth18_boundary_ab/start.pth
+# Run (or use train_siam_ab.sbatch): python curriculum_training_fast.py \
+#      --config-dir=conf --config-name=gn_hdc_deep_fast_turbo_siam18_ctrl
+# -----------------------------------------------------------------------------
 # gn_hdc_deep_fast.yaml + convergence-speed deltas (the model is capable; this
-# just helps it train faster/cleaner). Run:
-#   python curriculum_training_fast.py --config-name gn_hdc_deep_fast_turbo
+# just helps it train faster/cleaner).
 #
 # Deltas vs gn_hdc_deep_fast.yaml (everything else identical):
 #   1. accum_steps: 8          -> effective batch 8 at ZERO extra peak memory.
@@ -90,8 +100,10 @@ model:
 
 paths:
   loadcheckpoint: true
-  model: "./logs/tmp/synth18_gn_hdc_deep_turbo16/model.last.pth"
-  logdir: "./logs/tmp/synth18_gn_hdc_deep_turbo16/"
+  # Shared FROZEN start (see header). Both A/B runs load this exact file so the
+  # comparison starts from one identical point; only the loss differs.
+  model: "/data/users4/splis/data/segmentation/synth18_boundary_ab/start.pth"
+  logdir: "/data/users4/splis/data/segmentation/synth18_boundary_ab/ctrl/"
 
 client_creator:
   crop_tensor: False
@@ -110,6 +122,21 @@ dataloader:
 metrics:
   dice_every_n_steps: 10
   dice_subsample_stride: 4
+
+# Real-data validation (see boundary yaml for notes). Must MATCH the boundary run
+# so the A/B is comparable on identical real subjects.
+validation:
+  db: "MindfulTensors"
+  collection: "MRN"
+  datafield: "T1"
+  labelfield: "labelfused"    # already 18-class; values >=18 clamped to 0 (bg)
+  # host: "10.xxx.xxx.xxx"
+  num_subjects: 64
+  surface_metrics: true
+  surface_every_n_epochs: 5
+  nsd_tau: 1.0
+  spacing: [1.0, 1.0, 1.0]
+  fail_dice: 0.5
 
 experiment:
   # max_lr = 8 * lr_scale / 256 (single rep -> no 0.8^rep attenuation).
