@@ -168,3 +168,4 @@ logs/
 nifti_predictions/
 *.pth
 *.svgz
+*.nii.gz

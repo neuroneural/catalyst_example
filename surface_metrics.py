@@ -26,6 +26,21 @@ import numpy as np
 from scipy import ndimage
 
 
+# 18-class scheme (lut104_to_18). Short names so the metric tables stay aligned.
+LABELS_18 = {
+    0: "Background", 1: "CerebralWM", 2: "Cortex", 3: "LatVent",
+    4: "InfLatVent", 5: "CerebWM", 6: "CerebCortex", 7: "Thalamus",
+    8: "Caudate", 9: "Putamen", 10: "Pallidum", 11: "3rdVent",
+    12: "4thVent", 13: "BrainStem", 14: "Hippocampus", 15: "Amygdala",
+    16: "Accumbens", 17: "VentralDC", 18: "CSF", 19: "IHFissure", 20: "Skull",
+}
+
+
+def label_name(c, labels=None):
+    """Short structure name for a class index (falls back to 'class{c}')."""
+    return (labels or LABELS_18).get(int(c), f"class{c}")
+
+
 def _bbox_union(a, b, margin, shape):
     """Union bounding box of two boolean volumes, padded by `margin`, clamped."""
     idx = np.argwhere(a | b)

@@ -5,7 +5,7 @@
 # Ref: Hu et al., "Squeeze-and-Excitation Networks", CVPR 2018.
 mongo:
   host: "10.245.12.58"
-  host_slurm: "arctrdcn018.rs.gsu.edu"
+  host_slurm: "10.245.12.58" # "arctrdcn018.rs.gsu.edu"
   dbname: "MindfulTensors"
   collection: "MRN"
   index_id: "id"
@@ -30,6 +30,7 @@ model:
   use_groupnorm: False
   use_me: False
   use_se: True
+  use_checkpoint: False
   se:
     se_hidden_channels: 64    # width of excitation MLP (>> C=5 for real capacity)
     se_num_fc_layers: 3       # depth: in→hidden→hidden→out→σ
@@ -37,7 +38,7 @@ model:
   use_refiner: False
 
 paths:
-  loadcheckpoint: False
+  loadcheckpoint: True
   model: "./logs/tmp/synth3_se_h64_L3/model.last.pth"
   logdir: "./logs/tmp/synth3_se_h64_L3/"
 
@@ -45,10 +46,10 @@ client_creator:
   crop_tensor: False
 
 experiment:
-  lr_scale: 0.0001
+  lr_scale: 0.1
   maxreps: 10
   cubesizes_code: |
-    [192] + [256] * (maxreps - 1)
+    [256] + [256] * (maxreps - 1)
   numcubes_code: |
     [1] * maxreps
   numvolumes_code: |
@@ -58,7 +59,7 @@ experiment:
   databases_code: |
     ["MindfulTensors"] * maxreps
   collections_code: |
-    ["MRN"] * maxreps
+    ["HCP"] + ["MRN"] * (maxreps - 1)
   dbfields_code: |
     [("T1", "label3")] * maxreps
   epochs_code: |

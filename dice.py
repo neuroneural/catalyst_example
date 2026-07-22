@@ -137,37 +137,35 @@ def soft_skeleton(x, iters):
 
 
 def cldice_loss_from_probs(probs, targets, iters=5, include_bg=False,
-                           downsample=1, smooth=1.0):
+                           downsample=1, smooth=1.0, classes=None):
     """clDice topology loss: 1 - harmonic mean of topology precision/sensitivity.
 
     Rewards the predicted foreground's SKELETON lying inside the GT (and vice
-    versa), i.e. preserving connectivity of thin structures (sulci, thin
-    cerebellar WM) -- exactly what volumetric Dice is blind to. Train-only,
-    differentiable through the predicted probabilities. Channel-batched;
-    memory is fine on the training GPU. downsample>1 builds the skeletons at
-    1/ds resolution (presence-preserving for GT) to cut cost.
+    versa), i.e. preserving connectivity of thin structures (ventricle horns,
+    foliate WM) -- what volumetric Dice is blind to. Train-only, differentiable
+    through the predicted probabilities.
 
-    probs:   [B, C, D, H, W] softmax probabilities (grad).
-    targets: [B, D, H, W] int class indices.
+    `classes`: list of class indices to apply clDice to. None/empty => all
+    foreground. Restricting to thin/tubular structures keeps clDice's win while
+    sparing cortical/cerebellar SHEETS, which it over-thickens (resisting
+    thinning merges sulci). downsample>1 builds skeletons at 1/ds resolution
+    (presence-preserving for GT) to cut cost.
+
+    Processed ONE class per gradient-checkpoint segment: forward stores nothing,
+    and backward rebuilds only a single class's skeleton tape at a time -> peak
+    memory ~ one class, not all (full-res, all-class batched OOMs an 80GB GPU).
     """
     C = probs.shape[1]
-    start = 0 if include_bg else 1
-    K = C - start
-    ids = torch.arange(start, C, device=targets.device).view(1, K, 1, 1, 1)
-    V_pred = probs[:, start:]                                   # soft, grad
-    with torch.no_grad():
-        V_gt = (targets.unsqueeze(1) == ids).to(probs.dtype)    # hard one-hot
+    if classes:
+        class_list = [int(c) for c in classes
+                      if 0 <= int(c) < C and (include_bg or int(c) != 0)]
+    else:
+        class_list = list(range(0 if include_bg else 1, C))
+    if not class_list:
+        return probs.new_zeros(())
     ds = int(downsample)
-    if ds > 1:
-        V_pred = F.avg_pool3d(V_pred, kernel_size=ds, stride=ds)
-        V_gt = F.max_pool3d(V_gt, kernel_size=ds, stride=ds)    # presence-preserving
     dims = (2, 3, 4)
 
-    # The predicted skeleton sits in the grad path: ~2*iters+ pooling ops, each
-    # retaining a full activation for backward. Batched over K classes at full
-    # res that tape is tens of GB (OOM). So process ONE class per gradient-
-    # checkpoint segment: forward stores nothing, and in backward only a single
-    # class's skeleton tape is rebuilt at a time -> peak ~ one class, not K.
     def _class_cldice(vp, vg, Sg):
         Sp = soft_skeleton(vp, iters)
         tp = ((Sp * vg).sum(dims) + smooth) / (Sp.sum(dims) + smooth)   # pred skel in GT
@@ -175,16 +173,54 @@ def cldice_loss_from_probs(probs, targets, iters=5, include_bg=False,
         return (1.0 - 2.0 * tp * ts / (tp + ts)).mean()                 # scalar over B
 
     total = probs.new_zeros(())
-    for j in range(K):
-        vp = V_pred[:, j:j + 1]
-        vg = V_gt[:, j:j + 1]
+    for c in class_list:
+        vp = probs[:, c:c + 1]                                  # soft, grad
+        with torch.no_grad():
+            vg = (targets == c).unsqueeze(1).to(probs.dtype)    # hard one-hot
+        if ds > 1:
+            vp = F.avg_pool3d(vp, kernel_size=ds, stride=ds)
+            vg = F.max_pool3d(vg, kernel_size=ds, stride=ds)    # presence-preserving
         with torch.no_grad():
             Sg = soft_skeleton(vg, iters)          # GT skeleton: constant, grad-free
         if vp.requires_grad:
             total = total + checkpoint(_class_cldice, vp, vg, Sg, use_reentrant=False)
         else:
             total = total + _class_cldice(vp, vg, Sg)
-    return total / K
+    return total / len(class_list)
+
+
+def tversky_loss_from_probs(probs, targets, classes=None, alpha=0.7, beta=0.3,
+                            include_bg=False, smooth=1.0):
+    """Soft Tversky loss on selected classes (Salehi et al. 2017).
+
+    Tversky index = TP / (TP + alpha*FP + beta*FN); loss = 1 - index, averaged
+    over classes. alpha > beta penalizes FALSE POSITIVES more than false
+    negatives -> PRECISION-favoring: discourages a class bleeding outward. On
+    cortex that means less spilling into sulcal CSF -> sulci stay open (crisper
+    folds). Cheap/differentiable (no skeleton), train-only.
+
+    `classes`: which class indices to apply it to (e.g. [2,6] = cortex + cereb
+    cortex). None/empty => all foreground.
+    """
+    C = probs.shape[1]
+    if classes:
+        class_list = [int(c) for c in classes
+                      if 0 <= int(c) < C and (include_bg or int(c) != 0)]
+    else:
+        class_list = list(range(0 if include_bg else 1, C))
+    if not class_list:
+        return probs.new_zeros(())
+    total = probs.new_zeros(())
+    for c in class_list:
+        p = probs[:, c]
+        with torch.no_grad():
+            g = (targets == c).to(probs.dtype)
+        tp = (p * g).sum()
+        fp = (p * (1.0 - g)).sum()
+        fn = ((1.0 - p) * g).sum()
+        tv = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+        total = total + (1.0 - tv)
+    return total / len(class_list)
 
 
 def faster_dice(x, y, labels, fudge_factor=1e-8):
@@ -309,7 +345,9 @@ class CEDiceLoss(torch.nn.Module):
                  dice_smooth=1, boundary_weight=0.0, boundary_radius=8,
                  boundary_include_bg=False, boundary_downsample=2,
                  cldice_weight=0.0, cldice_iters=5, cldice_downsample=1,
-                 cldice_include_bg=False):
+                 cldice_include_bg=False, cldice_classes=None,
+                 tversky_weight=0.0, tversky_alpha=0.7, tversky_beta=0.3,
+                 tversky_classes=None):
         super(CEDiceLoss, self).__init__()
         self.w_ce, self.w_dice = float(loss_weight[0]), float(loss_weight[1])
         if class_weight is not None and not torch.is_tensor(class_weight):
@@ -329,6 +367,12 @@ class CEDiceLoss(torch.nn.Module):
         self.cldice_iters = int(cldice_iters)
         self.cldice_downsample = int(cldice_downsample)
         self.cldice_include_bg = bool(cldice_include_bg)
+        self.cldice_classes = list(cldice_classes) if cldice_classes else None
+        # Tversky (precision-favoring on selected classes; default 0 => off).
+        self.tversky_weight = float(tversky_weight)
+        self.tversky_alpha = float(tversky_alpha)
+        self.tversky_beta = float(tversky_beta)
+        self.tversky_classes = list(tversky_classes) if tversky_classes else None
 
     def _ce(self, log_probs, targets, C):
         eps = self.label_smoothing
@@ -353,7 +397,7 @@ class CEDiceLoss(torch.nn.Module):
             loss = loss + self.w_ce * self._ce(log_probs, targets, C)
         # probs reused by Dice, boundary and clDice terms -> one exp() at most.
         _need_probs = (self.w_dice != 0.0 or self.boundary_weight != 0.0
-                       or self.cldice_weight != 0.0)
+                       or self.cldice_weight != 0.0 or self.tversky_weight != 0.0)
         probs = log_probs.exp() if _need_probs else None
         if self.w_dice != 0.0:
             loss = loss + self.w_dice * soft_dice_from_probs(
@@ -368,7 +412,12 @@ class CEDiceLoss(torch.nn.Module):
         if self.cldice_weight != 0.0:
             loss = loss + self.cldice_weight * cldice_loss_from_probs(
                 probs, targets, self.cldice_iters, self.cldice_include_bg,
-                self.cldice_downsample,
+                self.cldice_downsample, classes=self.cldice_classes,
+            )
+        if self.tversky_weight != 0.0:
+            loss = loss + self.tversky_weight * tversky_loss_from_probs(
+                probs, targets, classes=self.tversky_classes,
+                alpha=self.tversky_alpha, beta=self.tversky_beta,
             )
         return loss
 

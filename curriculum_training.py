@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
 from dice import faster_dice, DiceLoss, CEDiceLoss
-from surface_metrics import all_class_metrics
+from surface_metrics import all_class_metrics, label_name
 from meshnet import enMesh_checkpoint, enMesh, enMesh_checkpoint_SE, enMesh_SE
 from meshnet_gn import enMesh_checkpoint as enMesh_checkpoint_gn, SpatialAEMeshNet
 from meshnetme import MeshNetME_checkpoint
@@ -283,6 +283,11 @@ class CustomRunner(dl.Runner):
         cldice_iters=5,
         cldice_downsample=1,
         cldice_include_bg=False,
+        cldice_classes=None,
+        tversky_weight=0.0,
+        tversky_alpha=0.7,
+        tversky_beta=0.3,
+        tversky_classes=None,
         ce_class_weight_overrides=None,
         valid_cfg=None,
         maxshape=300,
@@ -368,6 +373,11 @@ class CustomRunner(dl.Runner):
         self.cldice_iters = int(cldice_iters)
         self.cldice_downsample = int(cldice_downsample)
         self.cldice_include_bg = bool(cldice_include_bg)
+        self.cldice_classes = list(cldice_classes) if cldice_classes else None
+        self.tversky_weight = float(tversky_weight)
+        self.tversky_alpha = float(tversky_alpha)
+        self.tversky_beta = float(tversky_beta)
+        self.tversky_classes = list(tversky_classes) if tversky_classes else None
         self.ce_class_weight_overrides = dict(ce_class_weight_overrides or {})
         # Optional separate validation source + surface metrics (e.g. real MRN).
         # Empty dict => legacy behavior (validate on synth range(32), dice only).
@@ -1048,6 +1058,11 @@ class CustomRunner(dl.Runner):
         cldice_iters = int(getattr(self, "cldice_iters", 5))
         cldice_downsample = int(getattr(self, "cldice_downsample", 1))
         cldice_include_bg = bool(getattr(self, "cldice_include_bg", False))
+        cldice_classes = getattr(self, "cldice_classes", None)
+        tversky_weight = float(getattr(self, "tversky_weight", 0.0))
+        tversky_alpha = float(getattr(self, "tversky_alpha", 0.7))
+        tversky_beta = float(getattr(self, "tversky_beta", 0.3))
+        tversky_classes = getattr(self, "tversky_classes", None)
 
         # Fused path: one log_softmax shared by CE and Dice (saves a full
         # softmax volume at 104 classes / 256^3). Opt-in via cfg.model.loss_fused.
@@ -1061,7 +1076,12 @@ class CustomRunner(dl.Runner):
             if cldice_weight > 0:
                 print(f"[loss] clDice topology term ON: weight={cldice_weight} "
                       f"iters={cldice_iters} downsample={cldice_downsample} "
-                      f"include_bg={cldice_include_bg}",
+                      f"include_bg={cldice_include_bg} classes={cldice_classes or 'all-fg'}",
+                      file=sys.stderr, flush=True)
+            if tversky_weight > 0:
+                print(f"[loss] Tversky term ON: weight={tversky_weight} "
+                      f"alpha={tversky_alpha} beta={tversky_beta} "
+                      f"classes={tversky_classes or 'all-fg'}",
                       file=sys.stderr, flush=True)
             return CEDiceLoss(
                 loss_weight=tuple(self.loss_weight),
@@ -1076,12 +1096,17 @@ class CustomRunner(dl.Runner):
                 cldice_iters=cldice_iters,
                 cldice_downsample=cldice_downsample,
                 cldice_include_bg=cldice_include_bg,
+                cldice_classes=cldice_classes,
+                tversky_weight=tversky_weight,
+                tversky_alpha=tversky_alpha,
+                tversky_beta=tversky_beta,
+                tversky_classes=tversky_classes,
             ).to(self.engine.device)
 
-        if boundary_weight > 0 or cldice_weight > 0:
+        if boundary_weight > 0 or cldice_weight > 0 or tversky_weight > 0:
             raise ValueError(
-                "boundary_weight/cldice_weight>0 require model.loss_fused=True "
-                "(both are implemented in the fused CEDiceLoss path)."
+                "boundary_weight/cldice_weight/tversky_weight>0 require "
+                "model.loss_fused=True (all live in the fused CEDiceLoss path)."
             )
 
         ce_criterion = torch.nn.CrossEntropyLoss(
@@ -1222,7 +1247,7 @@ class CustomRunner(dl.Runner):
 
     def _reset_surface_acc(self):
         self._surf = {
-            c: {"dice": [], "nsd": [], "hd95": [], "assd": [], "miss": 0}
+            c: {"dice": [], "nsd": [], "hd95": [], "assd": [], "miss": 0, "gtvox": []}
             for c in range(1, self.n_classes)
         }
         self._surf_subj = []          # per-subject mean foreground Dice
@@ -1234,6 +1259,7 @@ class CustomRunner(dl.Runner):
             tau = float(self.valid_cfg.get("nsd_tau", 1.0))
             spacing = tuple(float(x) for x in self.valid_cfg.get("spacing", [1.0, 1.0, 1.0]))
             fail_dice = float(self.valid_cfg.get("fail_dice", 0.5))
+            exclude = set(int(x) for x in self.valid_cfg.get("metric_exclude_classes", []))
             pred = pred_t.reshape((-1,) + tuple(pred_t.shape[-3:])).to(torch.int16).cpu().numpy()
             gt = label_t.reshape((-1,) + tuple(label_t.shape[-3:])).to(torch.int64)
             gt = torch.where(gt < self.n_classes, gt, torch.zeros_like(gt))  # first-18 clamp
@@ -1251,7 +1277,9 @@ class CustomRunner(dl.Runner):
                             self._surf[c]["miss"] += 1
                         else:
                             self._surf[c]["hd95"].append(r["hd95"])
-                        fg.append(r["dice"])
+                        self._surf[c]["gtvox"].append(r["gt_vox"])
+                        if c not in exclude:            # context classes off the headline
+                            fg.append(r["dice"])
                 if fg:
                     self._surf_subj.append(float(np.mean(fg)))
         except Exception as exc:
@@ -1267,6 +1295,7 @@ class CustomRunner(dl.Runner):
         sum_nsd = torch.zeros(C, device=dev)
         sum_hd = torch.zeros(C, device=dev); cnt_hd = torch.zeros(C, device=dev)
         miss = torch.zeros(C, device=dev)
+        gtvox = torch.zeros(C, device=dev)      # total GT voxels/class (vol weights)
         min_dice = torch.full((C,), float("inf"), device=dev)
         max_hd = torch.full((C,), float("-inf"), device=dev)
         for c in range(1, C):
@@ -1278,6 +1307,7 @@ class CustomRunner(dl.Runner):
             if d["hd95"]:
                 sum_hd[c] = float(_np.sum(d["hd95"])); cnt_hd[c] = len(d["hd95"])
                 max_hd[c] = float(_np.max(d["hd95"]))
+            gtvox[c] = float(_np.sum(d["gtvox"])) if d["gtvox"] else 0.0
             miss[c] = d["miss"]
         fail_dice = float(self.valid_cfg.get("fail_dice", 0.5))
         subj = self._surf_subj
@@ -1289,7 +1319,7 @@ class CustomRunner(dl.Runner):
             try:
                 import torch.distributed as dist
                 if dist.is_available() and dist.is_initialized():
-                    for t in (sum_dice, cnt, sum_nsd, sum_hd, cnt_hd, miss, n_subj, n_fail):
+                    for t in (sum_dice, cnt, sum_nsd, sum_hd, cnt_hd, miss, gtvox, n_subj, n_fail):
                         dist.all_reduce(t, op=dist.ReduceOp.SUM)
                     dist.all_reduce(min_dice, op=dist.ReduceOp.MIN)
                     dist.all_reduce(max_hd, op=dist.ReduceOp.MAX)
@@ -1306,9 +1336,21 @@ class CustomRunner(dl.Runner):
                          (sum_nsd[c].item() / n) if n else float("nan"),
                          (sum_hd[c].item() / nh) if nh else float("nan"),
                          (max_hd[c].item() if nh else float("nan"))))
-        macro_dice = _np.nanmean([r[3] for r in rows]) if rows else float("nan")
-        macro_nsd = _np.nanmean([r[5] for r in rows]) if rows else float("nan")
-        macro_hd = _np.nanmean([r[6] for r in rows]) if rows else float("nan")
+        # Headline aggregates exclude context/undeployed classes (e.g. CSF/skull)
+        # so the number stays comparable to runs without them. Per-class table
+        # below still shows every class.
+        exclude = set(int(x) for x in self.valid_cfg.get("metric_exclude_classes", []))
+        agg = [r for r in rows if r[0] not in exclude]
+        macro_dice = _np.nanmean([r[3] for r in agg]) if agg else float("nan")
+        macro_nsd = _np.nanmean([r[5] for r in agg]) if agg else float("nan")
+        macro_hd = _np.nanmean([r[6] for r in agg]) if agg else float("nan")
+        # Volume-weighted Dice: each class weighted by its GT volume, so the big
+        # structures dominate and the tiny hard ones (class 4) barely count -- the
+        # "overall voxel quality" lens (vs macro's structure-equal lens).
+        _w = _np.array([gtvox[r[0]].item() for r in agg])
+        _d = _np.array([r[3] for r in agg])
+        _ok = _np.isfinite(_d) & (_w > 0)
+        volw_dice = float((_w[_ok] * _d[_ok]).sum() / _w[_ok].sum()) if _ok.any() else float("nan")
         nsubj = int(n_subj.item()); nfail = int(n_fail.item())
         worst_v = worst.item()
         fail_rate = nfail / max(1, nsubj)
@@ -1316,14 +1358,19 @@ class CustomRunner(dl.Runner):
         print("\n[valid-surface] per-class (Dice / minDice / NSD@%.1fmm / HD95 / HD95max):"
               % float(self.valid_cfg.get("nsd_tau", 1.0)), file=sys.stderr, flush=True)
         for (c, n, m, dm, dmin, nsd, hd, hdmx) in rows:
-            print(f"  cls {c:2d} n={n:3d} miss={m:2d}  dice={dm:.3f} min={dmin:.3f}  "
-                  f"nsd={nsd:.3f}  hd95={hd:.2f} max={hdmx:.2f}", file=sys.stderr, flush=True)
-        print(f"[valid-surface] MACRO dice={macro_dice:.4f} nsd={macro_nsd:.4f} "
-              f"hd95={macro_hd:.2f}mm | worst-subj={worst_v:.4f} "
-              f"fail(<{fail_dice})={fail_rate:.3f} ({nfail}/{nsubj})",
+            print(f"  cls {c:2d} {label_name(c):>12} n={n:3d} miss={m:2d}  "
+                  f"dice={dm:.3f} min={dmin:.3f}  nsd={nsd:.3f}  "
+                  f"hd95={hd:.2f} max={hdmx:.2f}", file=sys.stderr, flush=True)
+        _excl = f" [excl {sorted(exclude)}]" if exclude else ""
+        print(f"[valid-surface] MACRO dice={macro_dice:.4f} volw_dice={volw_dice:.4f} "
+              f"nsd={macro_nsd:.4f} hd95={macro_hd:.2f}mm | worst-subj={worst_v:.4f} "
+              f"fail(<{fail_dice})={fail_rate:.3f} ({nfail}/{nsubj}){_excl}",
               file=sys.stderr, flush=True)
 
+        # loader_metrics show in the epoch summary + wandb, NOT the per-batch tqdm
+        # bar (that's fed by self.meters), so these stay off the progress bar.
         self.loader_metrics["surf_macro_dice"] = macro_dice
+        self.loader_metrics["surf_volw_dice"] = volw_dice
         self.loader_metrics["surf_macro_nsd"] = macro_nsd
         self.loader_metrics["surf_macro_hd95"] = macro_hd
         self.loader_metrics["surf_worst_subject_dice"] = worst_v
@@ -1331,6 +1378,7 @@ class CustomRunner(dl.Runner):
             import wandb
             if wandb.run is not None:
                 payload = {"surface/valid/macro_dice": macro_dice,
+                           "surface/valid/volw_dice": volw_dice,
                            "surface/valid/macro_nsd": macro_nsd,
                            "surface/valid/macro_hd95": macro_hd,
                            "surface/valid/worst_subject_dice": worst_v,
@@ -1517,13 +1565,14 @@ class CustomRunner(dl.Runner):
             torch.cuda.synchronize()
 
         sample, label = batch
-        # Real validation labels (e.g. MRN `labelfused`) can carry class indices
-        # >= n_classes. CE gather / class_weight[targets] / dice would then index
-        # the 18-wide class dim out of bounds -> CUDA device-side assert. Clamp
-        # the OOR labels to 0 (background) = the "first n_classes" scheme. Guarded
-        # to the validation override only, so synth training labels are untouched.
-        if (not self.model.training) and self.valid_cfg.get("db"):
-            label = torch.where(label < self.n_classes, label, torch.zeros_like(label))
+        # Clamp any label index >= n_classes to 0 (background). CE gather /
+        # class_weight[targets] / dice would otherwise index the class dim out of
+        # bounds -> CUDA device-side assert. Two cases this covers: (1) real
+        # validation labels (MRN `labelfused` carries extra classes), and (2)
+        # training an N-class model on data with >N classes -- e.g. an 18-class
+        # model on the 0-20 synth: CSF/skull fold back into background, which IS
+        # the 18-class scheme. No-op when labels already fit [0, n_classes-1].
+        label = torch.where(label < self.n_classes, label, torch.zeros_like(label))
         refiner_delta_penalty = torch.zeros((), device=sample.device)
         refiner_base_loss = torch.zeros((), device=sample.device)
         scheduled_blend = 0.0 if getattr(self, "_refiner_frozen", False) else self.refiner_blend
@@ -2050,6 +2099,13 @@ def main(cfg: DictConfig):
     cldice_iters = int(cfg.model.get("cldice_iters", 5))
     cldice_downsample = int(cfg.model.get("cldice_downsample", 1))
     cldice_include_bg = bool(cfg.model.get("cldice_include_bg", False))
+    _clc = cfg.model.get("cldice_classes", None)
+    cldice_classes = list(OmegaConf.to_container(_clc, resolve=True)) if _clc is not None else None
+    tversky_weight = float(cfg.model.get("tversky_weight", 0.0))
+    tversky_alpha = float(cfg.model.get("tversky_alpha", 0.7))
+    tversky_beta = float(cfg.model.get("tversky_beta", 0.3))
+    _tvc = cfg.model.get("tversky_classes", None)
+    tversky_classes = list(OmegaConf.to_container(_tvc, resolve=True)) if _tvc is not None else None
     _cw = cfg.model.get("ce_class_weight_overrides", None)
     ce_class_weight_overrides = OmegaConf.to_container(_cw, resolve=True) if _cw is not None else {}
     _vc = cfg.get("validation", None)
@@ -2196,6 +2252,11 @@ def main(cfg: DictConfig):
             cldice_iters=cldice_iters,
             cldice_downsample=cldice_downsample,
             cldice_include_bg=cldice_include_bg,
+            cldice_classes=cldice_classes,
+            tversky_weight=tversky_weight,
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+            tversky_classes=tversky_classes,
             ce_class_weight_overrides=ce_class_weight_overrides,
             valid_cfg=valid_cfg,
             meshnetme=cfg.model.use_me,

@@ -59,6 +59,7 @@ DATAFIELD = _pop_opt("--datafield", "T1", str)
 TAU = _pop_opt("--tau", 1.0, float)
 SPACING = tuple(float(x) for x in _pop_opt("--spacing", "1,1,1", str).split(","))
 FAIL_DICE = _pop_opt("--fail-dice", 0.5, float)
+EXCLUDE = set(int(x) for x in _pop_opt("--exclude-classes", "", str).split(",") if x.strip())
 OUT_DIR = _pop_opt("--out", None, str)
 
 import hydra
@@ -75,7 +76,7 @@ from mindfultensors.utils import DBBatchSampler
 import curriculum_training as base
 import validate_checkpoint as vc          # reuse load_model + checkpoint plumbing
 vc._USE_BEST = USE_BEST                    # module-level flag load_model reads
-from surface_metrics import all_class_metrics
+from surface_metrics import all_class_metrics, label_name
 
 
 def build_loader(cfg, db_host, n_ids):
@@ -170,7 +171,7 @@ def main(cfg: DictConfig):
                              "spacing_mm": SPACING, "n_subjects": n_subj})
 
     # per-class accumulators over subjects (GT-present subjects only)
-    acc = {c: {"dice": [], "nsd": [], "hd95": [], "assd": [], "miss": 0, "present": 0}
+    acc = {c: {"dice": [], "nsd": [], "hd95": [], "assd": [], "miss": 0, "present": 0, "gtvox": 0.0}
            for c in range(1, n_classes)}
     subj_min_fg_dice = []
     n_fail = 0
@@ -201,7 +202,9 @@ def main(cfg: DictConfig):
                     acc[c]["miss"] += 1
                 else:
                     acc[c]["hd95"].append(r["hd95"])
-                fg_dice_this.append(r["dice"])
+                acc[c]["gtvox"] += r["gt_vox"]
+                if c not in EXCLUDE:           # context classes off the headline
+                    fg_dice_this.append(r["dice"])
         mean_fg = float(np.mean(fg_dice_this)) if fg_dice_this else float("nan")
         subj_min_fg_dice.append(mean_fg)
         if np.isfinite(mean_fg) and mean_fg < FAIL_DICE:
@@ -223,11 +226,18 @@ def main(cfg: DictConfig):
             "hd95_mean": _nanmean(a["hd95"]),
             "hd95_max": (float(np.max(a["hd95"])) if a["hd95"] else float("nan")),
             "assd_mean": _nanmean(a["assd"]),
+            "gtvox": a["gtvox"],
         })
 
-    macro_dice = _nanmean([r["dice_mean"] for r in rows])
-    macro_nsd = _nanmean([r["nsd_mean"] for r in rows])
-    macro_hd95 = _nanmean([r["hd95_mean"] for r in rows])
+    # headline aggregates exclude context/undeployed classes (per-class kept)
+    agg = [r for r in rows if r["class"] not in EXCLUDE]
+    macro_dice = _nanmean([r["dice_mean"] for r in agg])
+    macro_nsd = _nanmean([r["nsd_mean"] for r in agg])
+    macro_hd95 = _nanmean([r["hd95_mean"] for r in agg])
+    # volume-weighted Dice: big structures dominate, tiny hard ones barely count
+    _w = np.array([r["gtvox"] for r in agg]); _d = np.array([r["dice_mean"] for r in agg])
+    _ok = np.isfinite(_d) & (_w > 0)
+    volw_dice = float((_w[_ok] * _d[_ok]).sum() / _w[_ok].sum()) if _ok.any() else float("nan")
     worst_subj = float(np.nanmin(subj_min_fg_dice)) if subj_min_fg_dice else float("nan")
     fail_rate = n_fail / max(1, len(subj_min_fg_dice))
 
@@ -235,15 +245,16 @@ def main(cfg: DictConfig):
     print("\n" + "=" * 78)
     print(f"  REAL-DATA EVAL  {COLLECTION}  n={n_subj}  tau={TAU}mm  ckpt={cfg.paths.model}")
     print("=" * 78)
-    print(f"  {'cls':>3} {'n':>4} {'miss':>4} {'Dice':>7} {'Dmin':>7} "
+    print(f"  {'cls':>3} {'structure':>12} {'n':>4} {'miss':>4} {'Dice':>7} {'Dmin':>7} "
           f"{'NSD':>7} {'NSDmin':>7} {'HD95':>7} {'HD95mx':>7} {'ASSD':>7}")
     for r in rows:
-        print(f"  {r['class']:>3} {r['n_present']:>4} {r['n_miss']:>4} "
+        print(f"  {r['class']:>3} {label_name(r['class']):>12} {r['n_present']:>4} {r['n_miss']:>4} "
               f"{r['dice_mean']:>7.3f} {r['dice_min']:>7.3f} "
               f"{r['nsd_mean']:>7.3f} {r['nsd_min']:>7.3f} "
               f"{r['hd95_mean']:>7.2f} {r['hd95_max']:>7.2f} {r['assd_mean']:>7.2f}")
     print("-" * 78)
-    print(f"  MACRO  Dice={macro_dice:.4f}  NSD={macro_nsd:.4f}  HD95={macro_hd95:.2f}mm")
+    print(f"  MACRO  Dice={macro_dice:.4f}  VolWDice={volw_dice:.4f}  "
+          f"NSD={macro_nsd:.4f}  HD95={macro_hd95:.2f}mm")
     print(f"  TAIL   worst-subject mean-fg-Dice={worst_subj:.4f}  "
           f"failure-rate(<{FAIL_DICE})={fail_rate:.3f} ({n_fail}/{len(subj_min_fg_dice)})")
     print("=" * 78)
@@ -253,7 +264,7 @@ def main(cfg: DictConfig):
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
-    summary = {"macro_dice": macro_dice, "macro_nsd": macro_nsd,
+    summary = {"macro_dice": macro_dice, "volw_dice": volw_dice, "macro_nsd": macro_nsd,
                "macro_hd95": macro_hd95, "worst_subject_fg_dice": worst_subj,
                "failure_rate": fail_rate, "n_subjects": n_subj,
                "tau_mm": TAU, "collection": COLLECTION, "checkpoint": cfg.paths.model}
@@ -267,6 +278,7 @@ def main(cfg: DictConfig):
         table.add_data(*[r[k] for k in rows[0].keys()])
     wandb.log({"real_eval/per_class": table,
                "real_eval/macro_dice": macro_dice,
+               "real_eval/volw_dice": volw_dice,
                "real_eval/macro_nsd": macro_nsd,
                "real_eval/macro_hd95": macro_hd95,
                "real_eval/worst_subject_fg_dice": worst_subj,
