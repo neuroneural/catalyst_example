@@ -29,7 +29,7 @@ mongo:
 
 wandb:
   team: "neuroneural"
-  project: "aeq18"
+  project: "synth18"
   run_tag: "aeq_16ch_mult"
 
 bit16: True
