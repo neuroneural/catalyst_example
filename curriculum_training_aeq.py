@@ -193,6 +193,19 @@ class AEQRunner(fast.FastRunner):
             if self._aeq_step % max(1, every) == 1:
                 sample = batch[0]
                 passed, gap = m.random_mask_gate(sample, mask_frac=frac)
+                # DDP: make the verdict global (all ranks must agree, and the
+                # gate opens only if EVERY rank's batch passed), so gating_on
+                # never diverges across replicas. All ranks hit this at the
+                # same step, so the collective cannot deadlock.
+                try:
+                    import torch.distributed as dist
+                    if dist.is_available() and dist.is_initialized():
+                        t = torch.tensor(
+                            [1.0 if passed else 0.0], device=sample.device)
+                        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+                        passed = bool(t.item() > 0.5)
+                except Exception:
+                    pass
                 if passed and not m.gating_on:
                     print(f"[aeq] random-mask gate PASSED (gap={gap:.2e}) "
                           f"-> site gating ON", file=sys.stderr, flush=True)
