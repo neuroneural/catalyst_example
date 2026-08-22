@@ -1,0 +1,668 @@
+"""Adaptive Equilibrium MeshNet (Variant M of adaptive_equilibrium_design_v2.md).
+
+Two coupled fixed points:
+  inner contour  z : (B, C, D, H, W) voxel activations
+  outer contour  y : (B, C_y)        regime-selector vector
+
+Joint map (one Jacobi sweep):
+  z' = f(z, y, x)   -- weight-tied dilated conv stack, multiplicatively gated by m(y)
+  y' = g(y, z)      -- damped-tanh MLP on pooled z (optionally on solve residuals)
+
+Forward: safeguarded type-II Anderson on the block-normalized joint residual
+(Sec. 5), with optional per-site residual gating (Sec. 5.3, asynchronous
+relaxation).  Backward: RBP (Algorithm 1) with block-wise stopping (Sec. 6),
+wrapped in a custom autograd.Function so the tape holds exactly ONE evaluation
+of H.  Stability: per-layer L-infinity (row-sum) weight scaling (Sec. 7.2).
+
+Deviations from the doc (each measurable via config):
+  * `gate_position: post_norm` (default) applies m(y) AFTER GroupNorm, because
+    a per-channel gate applied before a per-channel/per-small-group
+    normalization is largely cancelled by that normalization -- GN divides out
+    the scale m just injected, so the intended spectrum modulation mostly dies.
+    `pre_norm` reproduces the doc's Sec. 3.4 literally for the ablation.
+  * `dilations: [1, 3, 9, 27]` (default) instead of the doc's single d=4: a
+    single dilation-4 3^3 conv grows the receptive field by only 8 voxels per
+    sweep, so covering a 256 cube needs ~32 sweeps -- the MDEQ receptive-field
+    bound the doc itself warns about (Sec. 3.5).  The ternary weight-tied
+    micro-stack grows RF by 80/sweep (4 sweeps cover 256^3) and each stage
+    exactly tiles the previous one's footprint, so the per-sweep RF is
+    HOLE-FREE at every sweep -- the same no-gridding doctrine as the
+    modelAE_hdc_deep coprime ramp, applied to the per-sweep set (with weight
+    tying, the composed schedule is the per-sweep set repeated K times, so
+    density must hold within the set itself).  Set `dilations: [4]` to
+    recover the doc's M-A, or the full 13-rate hdc_deep ramp to iterate the
+    existing explicit schedule as the equilibrium map (ablation 8).
+  * Anderson safeguarding is retrospective (reject at the NEXT sweep's already
+    -paid residual evaluation) instead of the doc's immediate re-evaluation,
+    which would double the per-sweep FLOPs.
+
+The model obeys the repo's trainer contract: `model(x) -> logits` under
+autocast; loss/backward handled by the runner.  Aux-head logits and the
+Jacobian penalty are stashed on the module for the criterion wrapper.
+"""
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+
+# --------------------------------------------------------------------------- #
+# small utils
+# --------------------------------------------------------------------------- #
+
+def _get(cfg, key, default):
+    if cfg is None:
+        return default
+    v = cfg.get(key, default)
+    return default if v is None else v
+
+
+def _act(name):
+    if name == "softplus":
+        return F.softplus
+    if name == "elu":
+        return F.elu
+    if name == "gelu":
+        return F.gelu
+    raise ValueError(name)
+
+
+def _block_norm(rz, ry):
+    """Sec. 5.1 block-normalized joint residual norm (fp32 scalar tensor)."""
+    nz = rz.float().norm() / math.sqrt(rz.numel())
+    ny = ry.float().norm() / math.sqrt(ry.numel())
+    return torch.sqrt(nz * nz + ny * ny)
+
+
+def _state_norm(z, y):
+    nz = z.float().norm() / math.sqrt(z.numel())
+    ny = y.float().norm() / math.sqrt(y.numel())
+    return torch.sqrt(nz * nz + ny * ny) + 1e-8
+
+
+# --------------------------------------------------------------------------- #
+# the fixed-point autograd.Function  (Sec. 6.4 wiring, Sec. 6.2 backward)
+# --------------------------------------------------------------------------- #
+
+class _AEQSolve(torch.autograd.Function):
+    """no_grad Anderson solve forward; RBP with block-wise stopping backward.
+
+    Params are passed as explicit inputs so DDP's grad hooks fire and so the
+    returned grads land in .grad through the normal engine path.
+    """
+
+    @staticmethod
+    def forward(ctx, x, y0, module, *params):
+        with torch.no_grad():
+            z_star, y_star = module._solve(x, y0)
+        ctx.module = module
+        ctx.save_for_backward(x.detach(), z_star.detach(), y_star.detach())
+        return z_star, y_star
+
+    @staticmethod
+    def backward(ctx, grad_z, grad_y):
+        module = ctx.module
+        x, z_star, y_star = ctx.saved_tensors
+        bw = module.bw_cfg
+        if grad_z is None:
+            grad_z = torch.zeros_like(z_star)
+        if grad_y is None:
+            grad_y = torch.zeros_like(y_star)
+
+        params = module._eq_params()
+        with torch.enable_grad():
+            z_in = z_star.detach().requires_grad_(True)
+            y_in = y_star.detach().requires_grad_(True)
+            x_in = x.detach().requires_grad_(True)
+            # ONE differentiable evaluation of the joint map -- the entire tape.
+            if module.bw_amp and x.is_cuda:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    fz, fy = module._H(z_in, y_in, x_in)
+            else:
+                fz, fy = module._H(z_in, y_in, x_in)
+
+            lz, ly = grad_z, grad_y
+            frozen_z = frozen_y = False
+            iters = 0
+            for k in range(int(bw["max_iter"])):
+                iters = k + 1
+                vz, vy = torch.autograd.grad(
+                    (fz, fy), (z_in, y_in), (lz, ly),
+                    retain_graph=True, allow_unused=True,
+                )
+                if vz is None:
+                    vz = torch.zeros_like(lz)
+                if vy is None:
+                    vy = torch.zeros_like(ly)
+                nlz, nly = vz + grad_z, vy + grad_y
+                dz = (nlz - lz).norm() / math.sqrt(lz.numel())
+                dy = (nly - ly).norm() / math.sqrt(ly.numel())
+                if not frozen_z:
+                    lz = nlz
+                if not frozen_y:
+                    ly = nly
+                # Sec. 6.2 block-wise adjoint stopping
+                frozen_z = frozen_z or bool(dz < bw["eps"])
+                frozen_y = frozen_y or bool(dy < bw["eps"])
+                if frozen_z and frozen_y:
+                    break
+            module.stats["bwd_iters"] = iters
+
+            grads = torch.autograd.grad(
+                (fz, fy), [x_in] + list(params), (lz, ly),
+                retain_graph=False, allow_unused=True,
+            )
+        gx = grads[0]
+        gparams = tuple(
+            (torch.zeros_like(p) if g is None else g)
+            for g, p in zip(grads[1:], params)
+        )
+        # inputs were: x, y0, module, *params
+        return (gx, None, None) + gparams
+
+
+# --------------------------------------------------------------------------- #
+# the model
+# --------------------------------------------------------------------------- #
+
+class AEQMeshNet(nn.Module):
+    def __init__(self, in_channels, n_classes, channels, aeq=None):
+        super().__init__()
+        aeq = aeq or {}
+        C = int(channels)
+        self.n_classes = int(n_classes)
+        self.C = C
+        self.C_y = int(_get(aeq, "C_y", 64))
+        self.coupling = str(_get(aeq, "coupling", "mult"))       # mult|add|none
+        self.gate_position = str(_get(aeq, "gate_position", "post_norm"))
+        self.m_max = float(_get(aeq, "m_max", 0.9))
+        self.alpha_outer = float(_get(aeq, "alpha_outer", 0.5))
+        self.dilations = list(_get(aeq, "dilations", [1, 3, 9, 27]))
+        self.n_groups = int(_get(aeq, "n_groups", 8))
+        if C % self.n_groups != 0:
+            self.n_groups = math.gcd(C, self.n_groups) or 1
+
+        sol = dict(_get(aeq, "solver", {}))
+        self.sol_cfg = {
+            "window_m": int(_get(sol, "window_m", 3)),
+            "beta": float(_get(sol, "beta", 0.8)),
+            "lambda_ridge": float(_get(sol, "lambda_ridge", 1e-4)),
+            "eps": float(_get(sol, "eps", 1e-3)),
+            "max_iter": int(_get(sol, "max_iter", 12)),
+            "history_dtype": str(_get(sol, "history_dtype", "bfloat16")),
+        }
+        bwd = dict(_get(aeq, "backward", {}))
+        self.bw_cfg = {
+            "max_iter": int(_get(bwd, "max_iter", 32)),
+            "eps": float(_get(bwd, "eps", 1e-4)),
+        }
+        self.bw_amp = bool(_get(bwd, "bwd_amp", False))
+
+        gat = dict(_get(aeq, "site_gating", {}))
+        self.gating_cfg = {
+            "enabled": bool(_get(gat, "enabled", False)),
+            "tau_0": float(_get(gat, "tau_0", 5e-4)),
+            "learned_threshold": bool(_get(gat, "learned_threshold", True)),
+        }
+        out = dict(_get(aeq, "outer", {}))
+        self.read_residual = bool(_get(out, "read_residual", False))
+        self.outer_grad = str(_get(out, "outer_grad", "implicit"))
+
+        stab = dict(_get(aeq, "stability", {}))
+        self.rowsum_target = float(_get(stab, "rowsum_target", 0.7))
+        self.rowsum_target_y = float(_get(stab, "rowsum_target_y", 0.9))
+        self.include_gn_gamma = bool(_get(stab, "include_gn_gamma", True))
+
+        loss = dict(_get(aeq, "loss", {}))
+        self.gamma_jac = float(_get(loss, "gamma_jac", 0.1))
+
+        ph = dict(_get(aeq, "phases", {}))
+        self.unroll_K = int(_get(ph, "unroll_K", 5))
+
+        # runtime phase switches (set by the runner / phase schedule)
+        self.mode = "solve"            # "unroll" | "solve"
+        self.act_name = "softplus"     # "softplus" -> "elu" at phase C
+        self.gating_on = False         # phase D, only after the random-mask gate
+        self.eval_max_iter = int(_get(sol, "eval_max_iter", self.sol_cfg["max_iter"]))
+
+        L = len(self.dilations)
+        self.L = L
+        # per-layer row-sum target so the composed product stays <= target
+        self.rowsum_target_layer = self.rowsum_target ** (1.0 / L)
+
+        # ---- explicit stem / head (outside the loop) ------------------------
+        self.stem = nn.Sequential(
+            nn.Conv3d(in_channels, C, 3, padding=1, bias=False),
+            nn.GroupNorm(self.n_groups, C, affine=True),
+        )
+        self.head = nn.Conv3d(C, n_classes, 1)
+        self.aux_head = nn.Linear(self.C_y, n_classes)   # Sec. 7.3 L_aux
+
+        # ---- inner map f: weight-tied dilated conv micro-stack --------------
+        self.convs = nn.ModuleList([
+            nn.Conv3d(C, C, 3, padding=d, dilation=d, bias=False)
+            for d in self.dilations
+        ])
+        self.norms = nn.ModuleList([
+            nn.GroupNorm(self.n_groups, C, affine=True) for _ in self.dilations
+        ])
+
+        # ---- coupling m(y) (Sec. 3.3) ---------------------------------------
+        if self.coupling == "mult":
+            self.gate = nn.Linear(self.C_y, L * C)
+        elif self.coupling == "add":
+            self.gate = nn.Linear(self.C_y, L * C)
+        else:
+            self.gate = None
+
+        # ---- outer map g (Sec. 3.2) ------------------------------------------
+        g_in = self.C_y + C + (2 if self.read_residual else 0)
+        self.g_mlp = nn.Sequential(
+            nn.Linear(g_in, 2 * self.C_y), nn.GELU(),
+            nn.Linear(2 * self.C_y, self.C_y),
+        )
+        # y_0 = tanh(Linear(pool(stem(x))))  (Sec. 4). NOTE: under outer_grad=
+        # implicit this Linear gets NO gradient (the equilibrium is init-
+        # independent); it is a deterministic, bounded seed, nothing more.
+        self.y_init = nn.Linear(C, self.C_y)
+
+        # learned per-site freezing threshold  tau = tau_0 * exp(-Linear(y))
+        self.tau_net = nn.Linear(self.C_y, 1) if self.gating_cfg["learned_threshold"] else None
+
+        # stashed per-forward extras for the criterion wrapper
+        self._aux_logits = None
+        self._jac_penalty = None
+        self.stats = {}
+
+        self._init_weights()
+
+    # ------------------------------------------------------------------ init
+    def _init_weights(self):
+        for m in [self.stem[0], self.head] + list(self.convs):
+            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        for m in self.g_mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.5)
+                nn.init.zeros_(m.bias)
+        if self.gate is not None:
+            nn.init.zeros_(self.gate.weight)
+            nn.init.zeros_(self.gate.bias)  # mult: m = m_max/2 everywhere at init
+        nn.init.xavier_normal_(self.y_init.weight, gain=0.5)
+        nn.init.zeros_(self.y_init.bias)
+        if self.tau_net is not None:
+            nn.init.zeros_(self.tau_net.weight)
+            nn.init.zeros_(self.tau_net.bias)
+
+    # -------------------------------------------------------- stability caps
+    def _scaled_conv_weight(self, i):
+        """Sec. 7.2 infinity-norm (row-sum) cap, per layer, gate- and
+        gamma-aware. Detached scalar scale -> plain scaled-weight gradient."""
+        W = self.convs[i].weight
+        rowsum = W.abs().sum(dim=(1, 2, 3, 4)).max()
+        gain = self.m_max if self.coupling == "mult" else 1.0
+        if self.include_gn_gamma and self.norms[i].weight is not None:
+            gain = gain * self.norms[i].weight.detach().abs().max().clamp(min=1e-6)
+        scale = (self.rowsum_target_layer / (gain * rowsum.detach() + 1e-12)).clamp(max=1.0)
+        return W * scale
+
+    def _scaled_linear_weight(self, lin, target):
+        W = lin.weight
+        rowsum = W.abs().sum(dim=1).max()
+        scale = (target / (rowsum.detach() + 1e-12)).clamp(max=1.0)
+        return W * scale
+
+    def rowsum_report(self):
+        """Effective (post-cap) per-layer row sums, for logging."""
+        rep = {}
+        with torch.no_grad():
+            for i in range(self.L):
+                W = self._scaled_conv_weight(i)
+                rep[f"rowsum_l{i}"] = float(W.abs().sum(dim=(1, 2, 3, 4)).max())
+        return rep
+
+    # ------------------------------------------------------------- the maps
+    def _gates(self, y):
+        """Returns list of per-layer (B, C, 1, 1, 1) modulation tensors."""
+        if self.gate is None:
+            return None
+        u = self.gate(y).view(y.shape[0], self.L, self.C)
+        if self.coupling == "mult":
+            u = self.m_max * torch.sigmoid(u)
+        return u.permute(1, 0, 2).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+    def _f(self, z, y, x):
+        """Inner map. x is the stem output (input injection)."""
+        act = _act(self.act_name)
+        gates = self._gates(y)
+        h = z
+        for i in range(self.L):
+            u = F.conv3d(h, self._scaled_conv_weight(i), None,
+                         padding=self.dilations[i], dilation=self.dilations[i])
+            if self.gate_position == "pre_norm":
+                # doc-literal Sec. 3.4: gate -> inject -> norm
+                if gates is not None:
+                    u = gates[i] * u if self.coupling == "mult" else u + gates[i]
+                if i == 0:
+                    u = u + x
+                u = self.norms[i](u)
+            else:
+                # post_norm (default): norm -> gate -> inject
+                u = self.norms[i](u)
+                if gates is not None:
+                    u = gates[i] * u if self.coupling == "mult" else u + gates[i]
+                if i == 0:
+                    u = u + x
+            h = act(u)
+        return h
+
+    def _g_pooled(self, y, s, q=None):
+        """Outer map on an already-pooled summary s = pool(z)."""
+        feats = [y, s]
+        if self.read_residual:
+            if q is None:
+                q = torch.zeros(y.shape[0], 2, device=y.device, dtype=y.dtype)
+            feats.append(q)
+        u = torch.cat(feats, dim=1)
+        u = self.g_mlp[1](self.g_mlp[0](u))
+        u = F.linear(u, self._scaled_linear_weight(self.g_mlp[2], self.rowsum_target_y),
+                     self.g_mlp[2].bias)
+        a = self.alpha_outer
+        return (1.0 - a) * y + a * torch.tanh(u)
+
+    def _g(self, y, z, q=None):
+        """Outer map: damped tanh MLP on [y, pool(z), (residual features)].
+        `g` reads z ONLY through a global pool (Sec. 3.2)."""
+        return self._g_pooled(y, z.mean(dim=(2, 3, 4)), q=q)
+
+    def _H(self, z, y, x, q=None):
+        """Joint Jacobi sweep from tick-k values (Sec. 4)."""
+        return self._f(z, y, x), self._g(y, z, q=q)
+
+    def _tau(self, y):
+        t0 = self.gating_cfg["tau_0"]
+        if self.tau_net is None:
+            return torch.full((y.shape[0],), t0, device=y.device, dtype=y.dtype)
+        return t0 * torch.exp(-self.tau_net(y).squeeze(-1)).clamp(max=1e3)
+
+    def _y0(self, x):
+        return torch.tanh(self.y_init(x.mean(dim=(2, 3, 4))))
+
+    def _eq_params(self):
+        """Parameters reachable through one evaluation of H (grads via RBP)."""
+        mods = [self.convs, self.norms, self.g_mlp]
+        if self.gate is not None:
+            mods.append(self.gate)
+        ps = []
+        for m in mods:
+            ps += [p for p in m.parameters() if p.requires_grad]
+        return ps
+
+    # ---------------------------------------------------------------- solver
+    def _solve(self, x, y0, force_random_mask=None, record_traj=False, z0=None):
+        """Safeguarded Anderson (type-II, Sec. 5.2) with optional per-site
+        gating (Sec. 5.3). Runs under no_grad (callers ensure it).
+
+        force_random_mask: float in (0,1) -> at every sweep freeze that
+        fraction of sites at random (the Sec. 7.2 empirical gate)."""
+        cfg = self.sol_cfg
+        m_win = cfg["window_m"]
+        beta = cfg["beta"]
+        hdt = (torch.bfloat16 if cfg["history_dtype"] == "bfloat16" and x.is_cuda
+               else torch.float32)
+        max_iter = cfg["max_iter"] if self.training else self.eval_max_iter
+
+        B = x.shape[0]
+        z = (torch.zeros(B, self.C, *x.shape[2:], device=x.device, dtype=x.dtype)
+             if z0 is None else z0.detach().clone())
+        y = y0.detach().clone()
+
+        Fh, Rh = [], []                      # map outputs / residuals (history)
+        prev_res = None
+        last_was_anderson = False
+        prev_rnorm = None                    # scalar ||r_z|| of previous sweep
+        q = None
+        traj = [] if record_traj else None
+        active_frac_curve = []
+        nfe = 0
+        rejects = 0
+        final_res = float("nan")
+
+        for k in range(max_iter):
+            # record (pool(z_k), q_k) BEFORE the sweep: this is exactly what
+            # fy = g(y_k, z_k, q_k) reads, so the detached-BPTT replay
+            # (Sec. 6.5) sees the same inputs the solve saw.
+            if record_traj:
+                q_rec = q if q is not None else torch.zeros(
+                    y.shape[0], 2, device=y.device, dtype=y.dtype)
+                traj.append((z.mean(dim=(2, 3, 4)).detach().clone(),
+                             q_rec.detach().clone()))
+
+            fz, fy = self._H(z, y, x, q=q)
+            nfe += 1
+            rz, ry = fz - z, fy - y
+            res = _block_norm(rz, ry)
+            rel = (res / _state_norm(fz, fy)).item()
+            final_res = rel
+
+            # residual features for the closed loop (Sec. 3.2)
+            if self.read_residual:
+                rn = rz.detach().flatten(1).float().norm(dim=1) \
+                    / math.sqrt(rz[0].numel())
+                q1 = torch.log10(rn + 1e-9).clamp(-9, 2) / 9.0
+                if prev_rnorm is None:
+                    q2 = torch.zeros_like(q1)
+                else:
+                    q2 = torch.log((rn + 1e-9) / (prev_rnorm + 1e-9)).clamp(-2, 2)
+                prev_rnorm = rn
+                q = torch.stack([q1, q2], dim=1).to(y.dtype)
+
+            if rel < cfg["eps"]:
+                z, y = fz, fy
+                break
+
+            # retrospective safeguard: the Anderson candidate we accepted last
+            # sweep made things worse -> revert to the plain step we skipped.
+            if (last_was_anderson and prev_res is not None
+                    and res > prev_res):
+                rejects += 1
+                z_prev_map, y_prev_map = Fh[-1]
+                z = z_prev_map.to(z.dtype)
+                y = y_prev_map.to(y.dtype)
+                Fh, Rh = Fh[-1:], Rh[-1:]
+                last_was_anderson = False
+                prev_res = None
+                continue
+            prev_res = res
+
+            # push MAP OUTPUT + normalized residual (Sec. 5.2)
+            Fh.append((fz.to(hdt), fy.to(hdt)))
+            Rh.append(torch.cat([
+                (rz / math.sqrt(rz.numel())).flatten(),
+                (ry / math.sqrt(ry.numel())).flatten(),
+            ]).to(hdt))
+            if len(Fh) > m_win:
+                Fh.pop(0), Rh.pop(0)
+
+            if len(Rh) > 1:
+                R = torch.stack([r.float() for r in Rh])         # (n, N)
+                G = R @ R.t()
+                n = G.shape[0]
+                G = G + cfg["lambda_ridge"] * (torch.diagonal(G).sum() / n) \
+                    * torch.eye(n, device=G.device)
+                try:
+                    v = torch.linalg.solve(G, torch.ones(n, device=G.device))
+                    alpha = (v / v.sum()).to(x.dtype)
+                except Exception:
+                    alpha = None
+                if alpha is not None and torch.isfinite(alpha).all():
+                    cz = sum(a * fz_i.to(x.dtype) for a, (fz_i, _) in zip(alpha, Fh))
+                    cy = sum(a * fy_i.to(x.dtype) for a, (_, fy_i) in zip(alpha, Fh))
+                    # damping beta mixes map outputs with iterates; we only kept
+                    # map outputs, so damp toward the current iterate instead.
+                    cand_z = beta * cz + (1 - beta) * z
+                    cand_y = beta * cy + (1 - beta) * y
+                    last_was_anderson = True
+                else:
+                    cand_z, cand_y = fz, fy
+                    last_was_anderson = False
+            else:
+                cand_z, cand_y = fz, fy
+                last_was_anderson = False
+
+            # per-site residual gating (asynchronous relaxation, Sec. 5.3)
+            use_gate = (self.gating_on and self.gating_cfg["enabled"]) \
+                or force_random_mask is not None
+            if use_gate:
+                if force_random_mask is not None:
+                    active = (torch.rand_like(z[:, :1]) > force_random_mask)
+                else:
+                    r_site = rz.detach().norm(dim=1, keepdim=True) / math.sqrt(self.C)
+                    tau = self._tau(y).view(-1, 1, 1, 1, 1)
+                    active = (r_site > tau)
+                active_frac_curve.append(float(active.float().mean()))
+                z = torch.where(active, cand_z, z)
+            else:
+                z = cand_z
+            y = cand_y
+
+        self.stats.update({
+            "nfe": nfe,
+            "fwd_rel_res": final_res,
+            "anderson_rejects": rejects,
+            "active_frac_last": active_frac_curve[-1] if active_frac_curve else 1.0,
+            "active_frac_curve": active_frac_curve,
+            "y_absmax": float(y.detach().abs().max()),
+        })
+        if self.coupling == "mult" and self.gate is not None:
+            g = self._gates(y)
+            self.stats["m_mean"] = float(g.mean())
+            self.stats["m_std_across_batch"] = float(g.mean(dim=(2, 3, 4, 5)).std())
+        if record_traj:
+            return z, y, traj
+        return z, y
+
+    # ------------------------------------------------------------ trajectories
+    def _replay_y(self, y0, traj):
+        """detached-BPTT (Sec. 6.5): re-run the tiny y-recurrence
+        differentiably on recorded, detached pooled summaries."""
+        y = y0
+        for s_k, q_k in traj:
+            y = self._g_pooled(y, s_k, q=q_k)
+        return y
+
+    # ---------------------------------------------------------------- forward
+    def _forward_unrolled(self, x, y0):
+        """Phase A: ordinary backprop through unroll_K Jacobi sweeps
+        (per-sweep gradient checkpointing keeps memory at ~one sweep)."""
+        z = torch.zeros(x.shape[0], self.C, *x.shape[2:],
+                        device=x.device, dtype=x.dtype)
+        y = y0
+
+        def sweep(z_, y_, x_):
+            return self._H(z_, y_, x_)
+
+        for _ in range(self.unroll_K):
+            if self.training and torch.is_grad_enabled():
+                z, y = checkpoint(sweep, z, y, x, use_reentrant=False)
+            else:
+                z, y = sweep(z, y, x)
+        self.stats.update({"nfe": self.unroll_K, "fwd_rel_res": float("nan")})
+        return z, y
+
+    def _ddp_zero_guard(self, ref):
+        """Zero-valued scalar touching params that may otherwise sit outside
+        the autograd graph (tau_net; y_init under implicit outer_grad;
+        aux_head when lambda_aux=0), so DDP never sees unused parameters."""
+        mods = [self.y_init, self.aux_head]
+        if self.tau_net is not None:
+            mods.append(self.tau_net)
+        s = sum(p.sum() for m in mods for p in m.parameters())
+        return (s * 0.0).to(ref.dtype)
+
+    def forward(self, x):
+        self.stats = {}
+
+        if not self.training:
+            # inference: plain no_grad solve, no autograd.Function involved
+            with torch.no_grad():
+                xin = self.stem(x)
+                y0 = self._y0(xin)
+                if self.mode == "unroll":
+                    z_star, y_star = self._forward_unrolled(xin, y0)
+                else:
+                    z_star, y_star = self._solve(xin, y0)
+                self._aux_logits = None
+                self._jac_penalty = None
+                return self.head(z_star)
+
+        xin = self.stem(x)
+        y0 = self._y0(xin)
+
+        if self.mode == "unroll":
+            z_star, y_star = self._forward_unrolled(xin, y0)
+        else:
+            use_bptt = (self.read_residual
+                        and self.outer_grad == "detached_bptt")
+            if use_bptt:
+                with torch.no_grad():
+                    _, _, traj = self._solve(xin.detach(), y0.detach(),
+                                             record_traj=True)
+            z_star, y_star = _AEQSolve.apply(
+                xin, y0, self, *self._eq_params())
+            if use_bptt and len(traj) > 0:
+                y_traj = self._replay_y(y0, traj)
+                # value = implicit y*, gradient = adjoint + trajectory paths
+                y_star = y_star + (y_traj - y_traj.detach())
+
+        logits = self.head(z_star)
+        logits = logits + self._ddp_zero_guard(logits)
+
+        self._aux_logits = self.aux_head(y_star)
+        self._jac_penalty = self._hutchinson_penalty(z_star, y_star, xin) \
+            if (self.gamma_jac > 0 and self.mode == "solve") else None
+        return logits
+
+    def _hutchinson_penalty(self, z_star, y_star, xin):
+        """gamma * ||F_z||_F^2, one Rademacher probe (Sec. 7.3). Second-order
+        through ONE evaluation of f."""
+        z_in = z_star.detach().requires_grad_(True)
+        fz = self._f(z_in, y_star.detach(), xin.detach())
+        eps = torch.randint_like(fz, 0, 2) * 2.0 - 1.0
+        (v,) = torch.autograd.grad(fz, z_in, eps, create_graph=True)
+        return (v * v).sum() / v.numel()
+
+    # convenience for the criterion wrapper
+    def pop_extra_losses(self):
+        aux, jac = self._aux_logits, self._jac_penalty
+        self._aux_logits, self._jac_penalty = None, None
+        return aux, jac
+
+    # ---------------------------------------------------------------- gates
+    @torch.no_grad()
+    def random_mask_gate(self, x, mask_frac=0.5):
+        """Sec. 7.2 mandatory empirical gate: does the asynchronously-frozen
+        solve land on the synchronous fixed point (within 2*eps_f)?"""
+        was = self.training
+        self.eval()
+        try:
+            xin = self.stem(x)
+            y0 = self._y0(xin)
+            z_s, y_s = self._solve(xin, y0)
+            z_a, y_a = self._solve(xin, y0, force_random_mask=mask_frac)
+            gap = float(_block_norm(z_a - z_s, y_a - y_s)
+                        / _state_norm(z_s, y_s))
+        finally:
+            self.train(was)
+        passed = gap < 2 * self.sol_cfg["eps"]
+        self.stats["async_gate_gap"] = gap
+        self.stats["async_gate_pass"] = float(passed)
+        return passed, gap
+
+
+def build_aeq_model(in_channels, n_classes, channels, aeq_cfg):
+    return AEQMeshNet(in_channels, n_classes, channels, aeq=aeq_cfg)
