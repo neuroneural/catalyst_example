@@ -102,6 +102,13 @@ model:
       max_iter: 12
       eval_max_iter: 16        # validation/inference budget
       history_dtype: bfloat16
+      # torch.compile the step f ONLY inside the no_grad solve (the RBP
+      # backward keeps its own eager evaluation of H, so implicit diff is
+      # untouched). Fuses conv->GN->gate->act; the main GPU-utilization
+      # lever. One recompile fires at the B->C activation switch. Set false
+      # to A/B or if the cluster torch chokes (a call-time failure also
+      # auto-falls back to eager permanently).
+      compile_step: true
 
     backward:                  # Sec. 6 RBP with block-wise stopping
       max_iter: 32
@@ -134,6 +141,13 @@ model:
       unroll_K: 5
       softplus_epochs: 10      # B: [5,10) solver+RBP, softplus
       gating_epoch: 15         # C: [10,15) ELU; D: [15,...) + site gating
+      # Added to the local epoch index. Each curriculum rep builds a fresh
+      # runner whose epoch count restarts at 0, which would drag a
+      # warm-started model back to phase A (unrolled + softplus). Set this
+      # on a RESUMED stage so it enters at the right phase -- e.g. after the
+      # 128 pre-train (aeq_siam18_16ch_pre128.yaml) completed A/B/C, run
+      # this config with model.aeq.phases.epoch_offset=15 to start in D.
+      epoch_offset: 0
 
 paths:
   loadcheckpoint: false
