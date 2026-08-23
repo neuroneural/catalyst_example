@@ -28,6 +28,7 @@ Run (one GPU is enough; no Mongo/wandb involved):
 import argparse
 import json
 import sys
+import time
 
 import torch
 import torch.nn.functional as F
@@ -71,18 +72,22 @@ def probe(args, phase):
     after_model = torch.cuda.memory_allocated() / G
     print(f"\n=== phase {phase} (mode={mode}, act={act}, gating={phase=='D'}) "
           f"cube={args.cube} C={args.channels} classes={args.classes} ===")
-    print(f"  params {n_par/1e6:.3f}M -> {after_model:.3f} GiB resident")
+    print(f"  params {n_par/1e6:.3f}M -> {after_model:.3f} GiB resident"
+          f"  [cudnn.benchmark={torch.backends.cudnn.benchmark}, "
+          f"compile={bool(args.compile_step)}, gamma_jac={args.gamma_jac}]")
     print(f"  {'step':>4} {'alloc':>9} {'peak':>9} {'reserved':>9}  "
-          f"{'d_alloc':>9}  nfe")
+          f"{'d_alloc':>9} {'sec':>8}  nfe")
 
     x = torch.randn(1, 1, *(args.cube,) * 3, device=dev)
     lab = torch.randint(0, args.classes, (1, *(args.cube,) * 3), device=dev)
-    prev_alloc, rows = None, []
+    prev_alloc, rows, times = None, [], []
     amp = torch.bfloat16 if args.bf16 else None
 
     for s in range(args.steps):
         opt.zero_grad(set_to_none=True)
         model.collect_stats = False
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
         if amp is not None:
             with torch.autocast("cuda", dtype=amp):
                 out = model(x)
@@ -98,13 +103,16 @@ def probe(args, phase):
             loss = loss + 0.1 * jac
         loss.backward()
         opt.step()
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
 
         a = torch.cuda.memory_allocated() / G
         p = torch.cuda.max_memory_allocated() / G
         r = torch.cuda.memory_reserved() / G
         d = "" if prev_alloc is None else f"{a - prev_alloc:+.4f}"
-        print(f"  {s:>4} {a:>9.3f} {p:>9.3f} {r:>9.3f}  {d:>9}  "
+        print(f"  {s:>4} {a:>9.3f} {p:>9.3f} {r:>9.3f}  {d:>9} {dt:>8.2f}  "
               f"{model.stats.get('nfe','-')}")
+        times.append(dt)
         rows.append(a)
         prev_alloc = a
 
@@ -116,6 +124,10 @@ def probe(args, phase):
                "no leak: live tensors flat after warmup ({:+.4f} GiB)"
                .format(drift))
     print(f"  -> {verdict}")
+    warm = times[2:] if len(times) > 3 else times[-1:]
+    print(f"  -> step time: first {times[0]:.2f}s, steady {sum(warm)/len(warm):.2f}s "
+          f"(min {min(warm):.2f} max {max(warm):.2f}) -- a steady time far above "
+          f"the min means REPEATED recompiles, not one-time compile")
     print(f"  -> peak {torch.cuda.max_memory_allocated()/G:.3f} GiB, "
           f"reserved {torch.cuda.memory_reserved()/G:.3f} GiB, "
           f"device {torch.cuda.get_device_properties(0).total_memory/G:.1f} GiB")
@@ -140,10 +152,18 @@ def main():
     ap.add_argument("--compile-step", type=int, default=0,
                     help="1 to include torch.compile (adds warmup noise)")
     ap.add_argument("--bf16", type=int, default=1)
+    ap.add_argument("--cudnn-benchmark", type=int, default=0,
+                    help="1 to match the trainer's perf.cudnn_benchmark=True; "
+                         "autotuning dilated convs can permanently balloon the "
+                         "caching-allocator pool -- the prime suspect for the "
+                         "gap between this probe and the real run")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         sys.exit("needs a GPU")
+    torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     phases = list(PHASES) if args.phase == "all" else [args.phase.upper()]
     out = []
     for ph in phases:
@@ -154,6 +174,9 @@ def main():
             torch.cuda.empty_cache()
             out.append({"phase": ph, "oom": True})
     print("\nsummary:", json.dumps(out))
+    print("reserved_gb is what nvitop shows. If it is small here but huge in "
+          "the real run, the extra memory is NOT the model -- retry with "
+          "--cudnn-benchmark 1 to test the autotuning-workspace hypothesis.")
 
 
 if __name__ == "__main__":
