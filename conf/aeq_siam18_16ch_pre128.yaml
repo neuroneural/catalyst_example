@@ -40,6 +40,14 @@ defaults:
 wandb:
   run_tag: "aeq_16ch_pre128"
 
+validation:
+  # Off for this stage: the model starts from random init, so real-data eval
+  # here measures noise, and training is on synthetic data anyway. Turning it
+  # on makes stage 1 double as the resolution-transfer probe (train 128 /
+  # validate 256 == design ablation 6) at the cost of a full 256^3 eval per
+  # epoch -- worth doing once the model is past phase A/B.
+  enabled: false
+
 paths:
   loadcheckpoint: false
   model: ""

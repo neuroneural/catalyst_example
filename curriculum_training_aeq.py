@@ -124,6 +124,47 @@ class AEQRunner(fast.FastRunner):
               file=sys.stderr, flush=True)
         return model
 
+    # ------------------------------------------------- validation on/off
+    def _validation_off(self):
+        """validation.enabled=false -> skip the valid loader entirely.
+        Cached on first call because get_loaders() below MUTATES valid_cfg,
+        and Catalyst may call get_callbacks() either side of it."""
+        if not hasattr(self, "_valid_off_cached"):
+            self._valid_off_cached = not bool(
+                (self.valid_cfg or {}).get("enabled", True))
+        return self._valid_off_cached
+
+    def get_loaders(self):
+        if not self._validation_off():
+            return super().get_loaders()
+        # Blank valid_cfg first so the base builder takes its cheap legacy
+        # branch instead of querying the real-data Mongo host for ids (that
+        # query would still run -- and could fail -- for a loader we discard).
+        self.valid_cfg = {}
+        loaders = super().get_loaders()
+        loaders.pop("valid", None)
+        print("[aeq] validation DISABLED (validation.enabled=false): no valid "
+              "loader; checkpoints key on TRAIN macro_dice",
+              file=sys.stderr, flush=True)
+        return loaders
+
+    def get_callbacks(self):
+        cbs = super().get_callbacks()
+        if not self._validation_off():
+            return cbs
+        # save_best would otherwise watch a loader that never runs.
+        params = {
+            "save_best": True,
+            "metric_key": "macro_dice",
+            "loader_key": "train",
+            "minimize": False,
+        }
+        if self.model_path:
+            params["resume_model"] = self.model_path
+        cbs["checkpoint"] = base.CompileSafeCheckpointCallback(
+            self._logdir, **params)
+        return cbs
+
     def get_criterion(self):
         crit = super().get_criterion()
         if not self.aeq_cfg.get("enabled", True):

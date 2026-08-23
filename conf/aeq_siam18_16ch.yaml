@@ -176,6 +176,12 @@ metrics:
   dice_subsample_stride: 4
 
 validation:
+  # false -> no valid loader at all (and no real-data Mongo id query), and
+  # save_best keys on TRAIN macro_dice instead. model.last.pth is still written
+  # every epoch, so a resumed stage-2 run is unaffected. Use it when validating
+  # would be uninformative (an untrained model) or the eval host is unreachable
+  # from the compute node. CLI: validation.enabled=false
+  enabled: true
   db: "MindfulTensors"
   collection: "MRN"
   datafield: "T1"
