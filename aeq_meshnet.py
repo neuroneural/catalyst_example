@@ -225,6 +225,28 @@ class AEQMeshNet(nn.Module):
         out = dict(_get(aeq, "outer", {}))
         self.read_residual = bool(_get(out, "read_residual", False))
         self.outer_grad = str(_get(out, "outer_grad", "implicit"))
+        # What summary of z the outer contour sees. MEASURED PROBLEM with
+        # "mean": the spatial mean of a feature map over a whole brain is
+        # almost identical from subject to subject, so y cannot tell inputs
+        # apart and m(y) collapses to a STATIC channel mask
+        # (aeq/m_std_across_inputs == 0). "mean_std" concatenates the spatial
+        # standard deviation, which carries far more between-subject
+        # variance, at the cost of doubling g's input width (so g_mlp[0]
+        # reinitializes when resuming a "mean" checkpoint). y stays
+        # shape-free either way, so resolution transfer is preserved.
+        self.pool_mode = str(_get(out, "pool", "mean"))
+        # COMMON-MODE REMOVAL. Measured: the pooled summary varies only ~1-2%
+        # across inputs (pooling over a whole brain destroys between-subject
+        # variance -- adding std pooling does NOT help, tested). g therefore
+        # sees a nearly constant absolute level, and the deviation that
+        # actually carries information is then attenuated four more times
+        # (rowsum_target_y cap, alpha damping, tanh, zero-init gate) until
+        # m(y) is input-blind (aeq/m_std_across_inputs == 0). Centering the
+        # summary against an EMA of its own history and dividing by its EMA
+        # std hands g the DEVIATION at O(1) scale instead. Buffers, not
+        # parameters, so checkpoints stay compatible.
+        self.center_pool = bool(_get(out, "center_pool", False))
+        self.center_momentum = float(_get(out, "center_momentum", 0.01))
 
         stab = dict(_get(aeq, "stability", {}))
         self.rowsum_target = float(_get(stab, "rowsum_target", 0.7))
@@ -284,7 +306,10 @@ class AEQMeshNet(nn.Module):
             self.gate = None
 
         # ---- outer map g (Sec. 3.2) ------------------------------------------
-        g_in = self.C_y + C + (2 if self.read_residual else 0)
+        self.pool_dim = C * (2 if self.pool_mode == "mean_std" else 1)
+        g_in = self.C_y + self.pool_dim + (2 if self.read_residual else 0)
+        self.register_buffer("pool_ema_mean", torch.zeros(self.pool_dim))
+        self.register_buffer("pool_ema_var", torch.ones(self.pool_dim))
         self.g_mlp = nn.Sequential(
             nn.Linear(g_in, 2 * self.C_y), nn.GELU(),
             nn.Linear(2 * self.C_y, self.C_y),
@@ -399,10 +424,34 @@ class AEQMeshNet(nn.Module):
         a = self.alpha_outer
         return (1.0 - a) * y + a * torch.tanh(u)
 
+    def _pool(self, z):
+        """Global summary of z that g is allowed to see (Sec. 3.2: g reads z
+        ONLY through a pool, which is what keeps y shape-free)."""
+        mu = z.mean(dim=(2, 3, 4))
+        if self.pool_mode != "mean_std":
+            return mu
+        sd = z.float().var(dim=(2, 3, 4), unbiased=False).add(1e-8).sqrt().to(mu.dtype)
+        return torch.cat([mu, sd], dim=1)
+
+    def _center(self, s):
+        """Hand g the DEVIATION of the pooled summary, not its level. The EMA
+        is updated from detached values only (it is a statistic, not a path
+        for gradients) and only while training the solver."""
+        if not self.center_pool:
+            return s
+        sd = s.detach().float()
+        if self.training:
+            mom = self.center_momentum
+            batch_mean = sd.mean(dim=0)
+            self.pool_ema_mean.mul_(1 - mom).add_(batch_mean, alpha=mom)
+            dev = (sd - self.pool_ema_mean).pow(2).mean(dim=0)
+            self.pool_ema_var.mul_(1 - mom).add_(dev, alpha=mom)
+        scale = self.pool_ema_var.clamp(min=1e-12).sqrt()
+        return ((s - self.pool_ema_mean.to(s.dtype)) / scale.to(s.dtype)).clamp(-8, 8)
+
     def _g(self, y, z, q=None):
-        """Outer map: damped tanh MLP on [y, pool(z), (residual features)].
-        `g` reads z ONLY through a global pool (Sec. 3.2)."""
-        return self._g_pooled(y, z.mean(dim=(2, 3, 4)), q=q)
+        """Outer map: damped tanh MLP on [y, pool(z), (residual features)]."""
+        return self._g_pooled(y, self._center(self._pool(z)), q=q)
 
     def _H(self, z, y, x, q=None):
         """Joint Jacobi sweep from tick-k values (Sec. 4)."""
@@ -501,7 +550,7 @@ class AEQMeshNet(nn.Module):
             if record_traj:
                 q_rec = q if q is not None else torch.zeros(
                     y.shape[0], 2, device=y.device, dtype=y.dtype)
-                traj.append((z.mean(dim=(2, 3, 4)).detach().clone(),
+                traj.append((self._center(self._pool(z)).detach().clone(),
                              q_rec.detach().clone()))
 
             try:
