@@ -286,6 +286,16 @@ class AEQRunner(fast.FastRunner):
                         log["aeq/active_frac_mean"] = sum(curve) / len(curve)
                     log.update({f"aeq/{k}": v
                                 for k, v in m.rowsum_report().items()})
+                    if torch.cuda.is_available():
+                        # allocated = live tensors; reserved = caching-allocator
+                        # pool (what nvidia-smi/nvitop shows). A climbing
+                        # ALLOCATED curve is a real leak; flat allocated with
+                        # high reserved is fragmentation/caching.
+                        g = 1024 ** 3
+                        log["aeq/mem_alloc_gb"] = torch.cuda.memory_allocated() / g
+                        log["aeq/mem_reserved_gb"] = torch.cuda.memory_reserved() / g
+                        log["aeq/mem_max_alloc_gb"] = (
+                            torch.cuda.max_memory_allocated() / g)
                     wandb.log(log, commit=False)
             except Exception:
                 pass
