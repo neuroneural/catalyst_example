@@ -282,6 +282,23 @@ class AEQMeshNet(nn.Module):
         self.center_momentum = float(_get(out, "center_momentum", 0.01))
 
         stab = dict(_get(aeq, "stability", {}))
+        # ADAPTIVE SPECTRAL CONTROL -- the only mechanism that actually bounds
+        # rho under gate_position=post_norm. Measured failure without it: a
+        # trained checkpoint reached rho = 3.22 (expansive), the solve residual
+        # sat at ~1.0 and DREW UPWARD over 40 sweeps, and the implicit gradient
+        # was therefore meaningless. Cause: GroupNorm is scale-invariant, so the
+        # row-sum cap on conv weights is erased; the only surviving Jacobian
+        # factors are the ones applied AFTER each GN -- the gate m, and the GN
+        # affine gamma. gamma is excluded from weight decay by the repo's
+        # optimizer, so it grew unchecked and rho went with it (gamma^L across
+        # L layers beats m_max, which only scales linearly).
+        # Fix: measure rho by power iteration every rho_every steps and fold a
+        # detached scalar into f's output so that s*rho -> rho_target. The
+        # scalar is a non-persistent buffer (checkpoint-safe) and it multiplies
+        # the map, so it cannot be normalized away by any downstream GN.
+        self.rho_target = float(_get(stab, "rho_target", 0.7))
+        self.rho_every = int(_get(stab, "rho_every", 20))
+        self.rho_control = bool(_get(stab, "rho_control", True))
         self.rowsum_target = float(_get(stab, "rowsum_target", 0.7))
         self.rowsum_target_y = float(_get(stab, "rowsum_target_y", 0.9))
         self.include_gn_gamma = bool(_get(stab, "include_gn_gamma", True))
@@ -347,6 +364,8 @@ class AEQMeshNet(nn.Module):
         # They are running statistics with a ~1/momentum step horizon (~100
         # steps at 0.01), so re-warming after a restart is cheap, and the
         # init (mean 0, var 1) makes _center a no-op until they warm up.
+        self.register_buffer("f_scale", torch.ones(()), persistent=False)
+        self._rho_step = 0
         self.register_buffer("pool_ema_mean", torch.zeros(self.pool_dim),
                              persistent=False)
         self.register_buffer("pool_ema_var", torch.ones(self.pool_dim),
@@ -449,6 +468,8 @@ class AEQMeshNet(nn.Module):
                 if i == 0:
                     u = u + x
             h = act(u)
+        if self.rho_control:
+            h = h * self.f_scale
         return h
 
     def _g_pooled(self, y, s, q=None):
@@ -824,11 +845,27 @@ class AEQMeshNet(nn.Module):
         logits = logits + self._ddp_zero_guard(logits)
 
         self._aux_logits = _lin(self.aux_head, y_star)
-        if self.collect_stats and self.mode == "solve":
-            try:
-                self.stats["rho_est"] = self._rho_estimate(z_star, y_star, xin)
-            except Exception:
-                pass
+        if self.mode == "solve":
+            self._rho_step += 1
+            # also fire on the FIRST step: f_scale is non-persistent, so a
+            # resumed run starts at 1.0 and would otherwise spend rho_every
+            # steps solving a possibly-divergent map before correcting.
+            due = (self.rho_control and self.training
+                   and (self._rho_step == 1
+                        or self._rho_step % max(1, self.rho_every) == 0))
+            if due or (self.collect_stats):
+                try:
+                    r = self._rho_estimate(z_star, y_star, xin)
+                    self.stats["rho_est"] = r
+                    self.stats["f_scale"] = float(self.f_scale)
+                    if due and r > 0:
+                        # s <- s * target/rho, clamped. rho was measured WITH
+                        # the current s applied, so this is a feedback update
+                        # and converges to rho == rho_target.
+                        new = float(self.f_scale) * (self.rho_target / r)
+                        self.f_scale.fill_(min(1.0, max(1e-3, new)))
+                except Exception:
+                    pass
         want_jac = (self.gamma_jac > 0 and self.mode == "solve"
                     and self.jac_this_step)
         # weight scaled by jac_every so the expected penalty is unchanged
