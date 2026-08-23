@@ -308,8 +308,16 @@ class AEQMeshNet(nn.Module):
         # ---- outer map g (Sec. 3.2) ------------------------------------------
         self.pool_dim = C * (2 if self.pool_mode == "mean_std" else 1)
         g_in = self.C_y + self.pool_dim + (2 if self.read_residual else 0)
-        self.register_buffer("pool_ema_mean", torch.zeros(self.pool_dim))
-        self.register_buffer("pool_ema_var", torch.ones(self.pool_dim))
+        # persistent=False keeps these OUT of state_dict. Catalyst's checkpoint
+        # callback loads with strict=True, so a persistent buffer added after a
+        # checkpoint was written is a hard "Missing key(s)" failure on resume.
+        # They are running statistics with a ~1/momentum step horizon (~100
+        # steps at 0.01), so re-warming after a restart is cheap, and the
+        # init (mean 0, var 1) makes _center a no-op until they warm up.
+        self.register_buffer("pool_ema_mean", torch.zeros(self.pool_dim),
+                             persistent=False)
+        self.register_buffer("pool_ema_var", torch.ones(self.pool_dim),
+                             persistent=False)
         self.g_mlp = nn.Sequential(
             nn.Linear(g_in, 2 * self.C_y), nn.GELU(),
             nn.Linear(2 * self.C_y, self.C_y),
