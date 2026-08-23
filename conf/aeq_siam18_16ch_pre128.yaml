@@ -62,6 +62,12 @@ experiment:
   maxreps: 1
   cubesizes_code: |
     [128] * maxreps
+  # NOTE: the *_code fields are Python expressions eval'd by the trainer, so
+  # they CANNOT be overridden cleanly from the CLI -- hydra's override grammar
+  # parses `[40] * maxreps` as a list followed by junk and rejects it, and the
+  # quoting needed to smuggle it through `srun bash -c "..."` (two shells) is
+  # `epochs_code=\"'[40] * maxreps'\"`. Edit this line instead.
   epochs_code: |
-    [16] * maxreps    # A:0-4  B:5-9  C:10-14  D:15  (ladder fully exercised,
-                      # incl. one epoch of site gating behind the async gate)
+    [40] * maxreps    # A:0-4  B:5-9  C:10-14  D:15+  (ladder done by 15; the
+                      # rest is real training, and a budget OneCycle can
+                      # anneal over -- 16 was a ladder-exercise budget only)
