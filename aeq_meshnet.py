@@ -298,7 +298,17 @@ class AEQMeshNet(nn.Module):
         # the map, so it cannot be normalized away by any downstream GN.
         self.rho_target = float(_get(stab, "rho_target", 0.7))
         self.rho_every = int(_get(stab, "rho_every", 20))
-        self.rho_control = bool(_get(stab, "rho_control", True))
+        # DEFAULT OFF. Measured harm: driving rho down by scaling f's output
+        # does not reduce the recurrence's own gain -- GroupNorm's 1/std factor
+        # cancels the scale exactly. rho only falls because the (unscaled)
+        # input injection comes to dominate, i.e. the mechanism works by
+        # AMPUTATING the recurrence. In a real run f_scale ratcheted to its
+        # 1e-3 floor (it is clamped <= 1, so it can only shrink) while the
+        # optimizer grew the GN gammas to compensate, and macro_dice collapsed
+        # to the background-only value. Do not enable without the structural
+        # fix: make f residual with the normalization OUTSIDE the recurrence,
+        # so weight/step-size norms actually control the Jacobian.
+        self.rho_control = bool(_get(stab, "rho_control", False))
         self.rowsum_target = float(_get(stab, "rowsum_target", 0.7))
         self.rowsum_target_y = float(_get(stab, "rowsum_target_y", 0.9))
         self.include_gn_gamma = bool(_get(stab, "include_gn_gamma", True))

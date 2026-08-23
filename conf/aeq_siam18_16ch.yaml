@@ -161,7 +161,8 @@ model:
       # PICK rho_target WITH solver.max_iter IN MIND (design Sec. 6.3):
       #   rho 0.5 -> converges in ~10 sweeps    (max_iter 12 is fine)
       #   rho 0.7 -> needs ~20-24 sweeps        (raise max_iter to ~24)
-      rho_control: true
+      rho_control: false   # DEFAULT OFF -- see aeq_meshnet.py; it amputates
+                            # the recurrence rather than stabilizing it.
       rho_target: 0.5
       rho_every: 20            # steps between re-measurements (~4 extra VJPs)
       # NOTE: inert under post_norm (GN normalizes the conv weight scale away).
