@@ -526,6 +526,12 @@ class AEQMeshNet(nn.Module):
         prev_res = None
         last_was_anderson = False
         prev_rnorm = None                    # scalar ||r_z|| of previous sweep
+        # Plain (non-extrapolated) map output of the IMMEDIATELY PRECEDING
+        # sweep. The safeguard reverts here, NOT to Fh[-1]: with check_every>1
+        # the history entry can be several sweeps stale, so reverting to it
+        # discarded that many sweeps of progress on every rejection (observed
+        # as anderson_rejects pinned at ~2 with the solve never converging).
+        prev_plain = None
         q = None
         traj = [] if record_traj else None
         active_frac_curve = []
@@ -604,9 +610,9 @@ class AEQMeshNet(nn.Module):
                 # at the last CHECKED sweep made things worse -> revert to the
                 # plain step we stored then. Pure float comparison, no sync.
                 if (last_was_anderson and prev_res is not None
-                        and r_abs > prev_res):
+                        and r_abs > prev_res and prev_plain is not None):
                     rejects += 1
-                    z_prev_map, y_prev_map = Fh[-1]
+                    z_prev_map, y_prev_map = prev_plain
                     z = z_prev_map.to(z.dtype)
                     y = y_prev_map.to(y.dtype)
                     Fh, Rh = Fh[-1:], Rh[-1:]
@@ -614,6 +620,10 @@ class AEQMeshNet(nn.Module):
                     prev_res = None
                     continue
                 prev_res = r_abs
+
+            # remember this sweep's PLAIN map output as the safeguard's
+            # one-sweep-back fallback (cheap: two tensors in history dtype).
+            prev_plain = (fz.to(hdt), fy.to(hdt))
 
             # push MAP OUTPUT + normalized residual (Sec. 5.2)
             Fh.append((fz.to(hdt), fy.to(hdt)))
