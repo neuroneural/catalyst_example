@@ -270,6 +270,11 @@ class AEQRunner(fast.FastRunner):
         want_log = (m.training and self._is_main()
                     and self._aeq_log_step % max(1, every) == 0)
         m.collect_stats = want_log
+        # Amortize the Hutchinson penalty (see AEQMeshNet.jac_every). All ranks
+        # use the same step counter, so they agree on which steps pay it --
+        # important under DDP, where a rank skipping it would change which
+        # parameters have grads.
+        m.jac_this_step = (self._aeq_log_step % m.jac_every == 0)
 
         out = super().handle_batch(batch)
 

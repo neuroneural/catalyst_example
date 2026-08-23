@@ -224,6 +224,16 @@ class AEQMeshNet(nn.Module):
 
         loss = dict(_get(aeq, "loss", {}))
         self.gamma_jac = float(_get(loss, "gamma_jac", 0.1))
+        # The Hutchinson penalty is the single most expensive component:
+        # measured at 128^3, gamma>0 costs +54% step time and +86% peak memory
+        # (8.73s/6.74GiB vs 5.67s/3.61GiB) because it is a double-backward
+        # through the whole inner map. It is a REGULARIZER, so paying it every
+        # step is not required: apply it every n-th step with the weight
+        # scaled by n, which preserves its expected contribution to the
+        # gradient at ~1/n the cost. 1 = every step (old behavior).
+        self.jac_every = max(1, int(_get(loss, "jac_every_n_steps", 1)))
+        # Set False by the trainer on steps that skip the penalty.
+        self.jac_this_step = True
 
         ph = dict(_get(aeq, "phases", {}))
         self.unroll_K = int(_get(ph, "unroll_K", 5))
@@ -678,8 +688,12 @@ class AEQMeshNet(nn.Module):
         logits = logits + self._ddp_zero_guard(logits)
 
         self._aux_logits = self.aux_head(y_star)
-        self._jac_penalty = self._hutchinson_penalty(z_star, y_star, xin) \
-            if (self.gamma_jac > 0 and self.mode == "solve") else None
+        want_jac = (self.gamma_jac > 0 and self.mode == "solve"
+                    and self.jac_this_step)
+        # weight scaled by jac_every so the expected penalty is unchanged
+        self._jac_penalty = (
+            self._hutchinson_penalty(z_star, y_star, xin) * float(self.jac_every)
+            if want_jac else None)
         return logits
 
     def _hutchinson_penalty(self, z_star, y_star, xin):

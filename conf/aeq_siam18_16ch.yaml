@@ -141,7 +141,15 @@ model:
 
     loss:                      # Sec. 7.3
       lambda_aux: 0.1          # aux head on y* -> per-class volume fractions
-      gamma_jac: 0.1           # Hutchinson ||F_z||_F^2, 1 probe
+      # Hutchinson ||F_z||_F^2, 1 Rademacher probe. MEASURED COST at 128^3:
+      # gamma>0 is +54% step time and +86% peak memory (8.73s/6.74GiB vs
+      # 5.67s/3.61GiB) because it is a double-backward through the inner map.
+      # Its benefit here is unverified (the NFE win in the design doc is
+      # MDEQ's published result). Keep it, but pay it every n-th step with
+      # the weight scaled by n (same expected gradient, ~1/n the cost).
+      # Set gamma_jac: 0.0 to drop it entirely and watch aeq/nfe.
+      gamma_jac: 0.1
+      jac_every_n_steps: 4
       # lambda_ponder intentionally not implemented (Phase 3; collapse hazard)
 
     phases:                    # Sec. 7.1 warm-up (epoch boundaries, 0-based)
