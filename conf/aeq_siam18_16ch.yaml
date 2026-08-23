@@ -131,6 +131,21 @@ model:
     outer:
       read_residual: false     # closed-loop adaptivity; flip on at Milestone 2
       outer_grad: implicit     # implicit | detached_bptt (with read_residual)
+      # What summary of z the outer contour sees. mean | mean_std.
+      # MEASURED: the spatial mean over a whole brain varies only ~1-2%
+      # between subjects, and adding std pooling does NOT improve that
+      # (tested). So mean_std is available but not evidence-backed.
+      pool: mean
+      # Common-mode removal on the pooled summary: centre it against an EMA
+      # of its own history and divide by the EMA std, so g receives the
+      # DEVIATION at O(1) scale instead of a nearly-constant level. Without
+      # it the ~1% between-subject signal is attenuated by the rowsum_target_y
+      # cap, the alpha damping, tanh and the zero-init gate until m(y) is
+      # input-blind (aeq/m_std_across_inputs == 0, observed). At init this
+      # gives ~7x more across-input variation in y (~20x relative), but it is
+      # an A/B candidate, not a proven fix. Buffers only -- checkpoint-safe.
+      center_pool: false
+      center_momentum: 0.01
 
     stability:                 # Sec. 7.2 infinity-norm control
       rowsum_target: 0.7       # composed product cap across the micro-stack
