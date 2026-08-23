@@ -60,6 +60,15 @@ def _get(cfg, key, default):
     return default if v is None else v
 
 
+def _lin(layer, t, *a, **kw):
+    """Apply a Linear whatever the input dtype. The RBP backward rebuilds the
+    tape from tensors saved by an autocast forward, so bf16 activations can
+    meet fp32 weights there ("mat1 and mat2 must have the same dtype"). Under
+    autocast this cast is a no-op (autocast re-casts for the matmul anyway);
+    outside it, the layer simply runs in its own precision."""
+    return layer(t.to(layer.weight.dtype), *a, **kw)
+
+
 def _act(name):
     if name == "softplus":
         return F.softplus
@@ -99,6 +108,25 @@ class _AEQSolve(torch.autograd.Function):
         with torch.no_grad():
             z_star, y_star = module._solve(x, y0)
         ctx.module = module
+        # Record the forward's autocast state. The autograd engine runs
+        # backward with autocast DISABLED, so without this the tape below is
+        # built under a different dtype policy than the solve that produced
+        # z*/y* -- bf16 saved tensors then meet fp32 Linear weights
+        # ("mat1 and mat2 must have the same dtype"). Beyond the crash, the
+        # implicit gradient must be taken w.r.t. the SAME map the forward
+        # solved, so matching the policy is correctness, not just plumbing.
+        _dev = "cuda" if x.is_cuda else "cpu"
+        try:
+            ctx.amp_enabled = bool(torch.is_autocast_enabled(_dev))
+        except TypeError:      # older torch: no device arg
+            ctx.amp_enabled = bool(torch.is_autocast_enabled()
+                                   or torch.is_autocast_cpu_enabled())
+        try:
+            ctx.amp_dtype = torch.get_autocast_dtype("cuda" if x.is_cuda else "cpu")
+        except Exception:                       # older torch
+            ctx.amp_dtype = (torch.get_autocast_gpu_dtype() if x.is_cuda
+                             else torch.bfloat16)
+        ctx.amp_device = "cuda" if x.is_cuda else "cpu"
         ctx.save_for_backward(x.detach(), z_star.detach(), y_star.detach())
         return z_star, y_star
 
@@ -113,16 +141,21 @@ class _AEQSolve(torch.autograd.Function):
             grad_y = torch.zeros_like(y_star)
 
         params = module._eq_params()
-        with torch.enable_grad():
+        import contextlib
+        # Rebuild the tape under the FORWARD's autocast policy (see forward).
+        # bw_amp=True forces bf16 even if the forward ran in fp32.
+        if getattr(ctx, "amp_enabled", False) or (module.bw_amp and x.is_cuda):
+            amp_ctx = torch.autocast(
+                getattr(ctx, "amp_device", "cuda" if x.is_cuda else "cpu"),
+                dtype=getattr(ctx, "amp_dtype", torch.bfloat16))
+        else:
+            amp_ctx = contextlib.nullcontext()
+        with torch.enable_grad(), amp_ctx:
             z_in = z_star.detach().requires_grad_(True)
             y_in = y_star.detach().requires_grad_(True)
             x_in = x.detach().requires_grad_(True)
             # ONE differentiable evaluation of the joint map -- the entire tape.
-            if module.bw_amp and x.is_cuda:
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    fz, fy = module._H(z_in, y_in, x_in)
-            else:
-                fz, fy = module._H(z_in, y_in, x_in)
+            fz, fy = module._H(z_in, y_in, x_in)
 
             lz, ly = grad_z, grad_y
             frozen_z = frozen_y = False
@@ -388,7 +421,7 @@ class AEQMeshNet(nn.Module):
         """Returns list of per-layer (B, C, 1, 1, 1) modulation tensors."""
         if self.gate is None:
             return None
-        u = self.gate(y).view(y.shape[0], self.L, self.C)
+        u = _lin(self.gate, y).view(y.shape[0], self.L, self.C)
         if self.coupling == "mult":
             u = self.m_max * torch.sigmoid(u)
         return u.permute(1, 0, 2).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -426,9 +459,9 @@ class AEQMeshNet(nn.Module):
                 q = torch.zeros(y.shape[0], 2, device=y.device, dtype=y.dtype)
             feats.append(q)
         u = torch.cat(feats, dim=1)
-        u = self.g_mlp[1](self.g_mlp[0](u))
-        u = F.linear(u, self._scaled_linear_weight(self.g_mlp[2], self.rowsum_target_y),
-                     self.g_mlp[2].bias)
+        u = self.g_mlp[1](_lin(self.g_mlp[0], u))
+        _w = self._scaled_linear_weight(self.g_mlp[2], self.rowsum_target_y)
+        u = F.linear(u.to(_w.dtype), _w, self.g_mlp[2].bias)
         a = self.alpha_outer
         return (1.0 - a) * y + a * torch.tanh(u)
 
@@ -488,10 +521,10 @@ class AEQMeshNet(nn.Module):
         t0 = self.gating_cfg["tau_0"]
         if self.tau_net is None:
             return torch.full((y.shape[0],), t0, device=y.device, dtype=y.dtype)
-        return t0 * torch.exp(-self.tau_net(y).squeeze(-1)).clamp(max=1e3)
+        return t0 * torch.exp(-_lin(self.tau_net, y).squeeze(-1)).clamp(max=1e3)
 
     def _y0(self, x):
-        return torch.tanh(self.y_init(x.mean(dim=(2, 3, 4))))
+        return torch.tanh(_lin(self.y_init, x.mean(dim=(2, 3, 4))))
 
     def _eq_params(self):
         """Parameters reachable through one evaluation of H (grads via RBP)."""
@@ -790,7 +823,7 @@ class AEQMeshNet(nn.Module):
         logits = self.head(z_star)
         logits = logits + self._ddp_zero_guard(logits)
 
-        self._aux_logits = self.aux_head(y_star)
+        self._aux_logits = _lin(self.aux_head, y_star)
         if self.collect_stats and self.mode == "solve":
             try:
                 self.stats["rho_est"] = self._rho_estimate(z_star, y_star, xin)
