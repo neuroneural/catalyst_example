@@ -724,6 +724,11 @@ class AEQMeshNet(nn.Module):
         logits = logits + self._ddp_zero_guard(logits)
 
         self._aux_logits = self.aux_head(y_star)
+        if self.collect_stats and self.mode == "solve":
+            try:
+                self.stats["rho_est"] = self._rho_estimate(z_star, y_star, xin)
+            except Exception:
+                pass
         want_jac = (self.gamma_jac > 0 and self.mode == "solve"
                     and self.jac_this_step)
         # weight scaled by jac_every so the expected penalty is unchanged
@@ -731,6 +736,33 @@ class AEQMeshNet(nn.Module):
             self._hutchinson_penalty(z_star, y_star, xin) * float(self.jac_every)
             if want_jac else None)
         return logits
+
+    def _rho_estimate(self, z_star, y_star, xin, iters=3):
+        """Power-iteration estimate of rho(dF/dz) at the fixed point.
+
+        WHY THIS EXISTS: the Sec. 7.2 row-sum cap is INERT under
+        gate_position=post_norm. GroupNorm is scale-invariant --
+        GN(a*W*z) = GN(W*z) -- so scaling the conv weights (what the cap
+        does) is cancelled by the GN that follows. Measured: sweeping
+        rowsum_target 0.9 -> 0.1 moves rho only 0.369 -> 0.345. Under
+        pre_norm the cap does bite, because the injected x breaks the scale
+        invariance. So in the default mode rho is set by m_max and the GN/act
+        gains, NOT by the stability target, and it must be measured rather
+        than assumed. rho >= 1 means the solve can diverge and the
+        asynchronous site-gating licence (rho(|J|) < 1) is void.
+        """
+        z_in = z_star.detach().requires_grad_(True)
+        with torch.enable_grad():
+            out = self._f(z_in, y_star.detach(), xin.detach())
+            v = torch.randn_like(z_in)
+            v = v / (v.norm() + 1e-12)
+            r = float("nan")
+            for _ in range(iters):
+                (Jv,) = torch.autograd.grad(out, z_in, v, retain_graph=True)
+                n = Jv.norm()
+                r = float(n)
+                v = Jv / (n + 1e-12)
+        return r
 
     def _hutchinson_penalty(self, z_star, y_star, xin):
         """gamma * ||F_z||_F^2, one Rademacher probe (Sec. 7.3). Second-order
