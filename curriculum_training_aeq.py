@@ -144,6 +144,12 @@ class AEQRunner(fast.FastRunner):
         a_end = int(ph.get("unroll_epochs", 5))
         b_end = int(ph.get("softplus_epochs", 10))     # cumulative
         d_start = int(ph.get("gating_epoch", 15))
+        # Each curriculum rep builds a FRESH runner, so the local epoch index
+        # restarts at 0 -- which would drag a warm-started model back to
+        # phase A (unrolled + softplus after it had reached ELU). Set
+        # phases.epoch_offset on a resumed stage to enter at the right phase
+        # (e.g. offset >= gating_epoch => start already in phase D).
+        epoch_idx = epoch_idx + int(ph.get("epoch_offset", 0))
 
         if epoch_idx < a_end:
             mode, act, phase = "unroll", "softplus", "A"
@@ -215,26 +221,33 @@ class AEQRunner(fast.FastRunner):
                           file=sys.stderr, flush=True)
                 m.gating_on = passed
 
+        # Decide BEFORE the forward whether this step collects the sync-costly
+        # scalar stats (m_mean, y_absmax, per-sweep active fraction). On every
+        # other step the solver skips them entirely.
+        every = int((self.aeq_cfg.get("log", {}) or {}).get("every_n_steps", 20))
+        self._aeq_log_step = getattr(self, "_aeq_log_step", 0) + 1
+        want_log = (m.training and self._is_main()
+                    and self._aeq_log_step % max(1, every) == 0)
+        m.collect_stats = want_log
+
         out = super().handle_batch(batch)
 
-        # wandb-only diagnostics (off the tqdm bar), main rank, every 20 steps
-        if m.training and self._is_main():
-            self._aeq_log_step = getattr(self, "_aeq_log_step", 0) + 1
-            if self._aeq_log_step % 20 == 0:
-                try:
-                    import wandb
-                    if wandb.run is not None:
-                        s = m.stats
-                        log = {f"aeq/{k}": v for k, v in s.items()
-                               if isinstance(v, (int, float))}
-                        curve = s.get("active_frac_curve") or []
-                        if curve:
-                            log["aeq/active_frac_mean"] = sum(curve) / len(curve)
-                        log.update({f"aeq/{k}": v
-                                    for k, v in m.rowsum_report().items()})
-                        wandb.log(log, commit=False)
-                except Exception:
-                    pass
+        # wandb-only diagnostics (off the tqdm bar)
+        if want_log:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    s = m.stats
+                    log = {f"aeq/{k}": v for k, v in s.items()
+                           if isinstance(v, (int, float))}
+                    curve = s.get("active_frac_curve") or []
+                    if curve:
+                        log["aeq/active_frac_mean"] = sum(curve) / len(curve)
+                    log.update({f"aeq/{k}": v
+                                for k, v in m.rowsum_report().items()})
+                    wandb.log(log, commit=False)
+            except Exception:
+                pass
         return out
 
 

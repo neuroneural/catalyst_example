@@ -109,6 +109,14 @@ model:
       # to A/B or if the cluster torch chokes (a call-time failure also
       # auto-falls back to eager permanently).
       compile_step: true
+      # Evaluate the convergence test + Anderson safeguard only every k-th
+      # sweep (always on the last). Each check is ONE device->host sync that
+      # drains the pipeline; k=3 cuts ~2/3 of them. Cost of k>1: a bad
+      # extrapolation survives up to k-1 sweeps (bounded, rho is capped) and
+      # the solve can overshoot convergence by up to k-1 sweeps -- at ~4
+      # convs/sweep that overshoot is real compute, so do NOT raise k far.
+      # Measure it/s; if it does not improve, set back to 1 (exact behavior).
+      check_every: 3
 
     backward:                  # Sec. 6 RBP with block-wise stopping
       max_iter: 32

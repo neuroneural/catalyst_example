@@ -193,7 +193,13 @@ class AEQMeshNet(nn.Module):
             "eps": float(_get(sol, "eps", 1e-3)),
             "max_iter": int(_get(sol, "max_iter", 12)),
             "history_dtype": str(_get(sol, "history_dtype", "bfloat16")),
+            "compile_step": bool(_get(sol, "compile_step", True)),
+            "check_every": int(_get(sol, "check_every", 1)),
         }
+        # Set False by the trainer on non-logging steps to skip the handful of
+        # scalar stats that each cost a host sync (m_mean, y_absmax, ...).
+        self.collect_stats = True
+        self._compiled_f = None   # lazy torch.compile twin of _f (solve only)
         bwd = dict(_get(aeq, "backward", {}))
         self.bw_cfg = {
             "max_iter": int(_get(bwd, "max_iter", 32)),
@@ -383,6 +389,25 @@ class AEQMeshNet(nn.Module):
         """Joint Jacobi sweep from tick-k values (Sec. 4)."""
         return self._f(z, y, x), self._g(y, z, q=q)
 
+    def _solver_f(self, x):
+        """torch.compile twin of _f, used ONLY inside the no_grad forward
+        solve. Implicit differentiation is untouched: the RBP backward builds
+        its VJPs against a separate EAGER evaluation of H at the fixed point
+        (Sec. 6.4), so the compiled graph only ever helps FIND z*, never
+        differentiate through it. Eager GN + gates + residual chains are
+        unfused bandwidth-bound kernels -- this is the main watts lever.
+
+        Dynamo guards on self.act_name, so the phase B->C activation switch
+        triggers exactly one recompile (expected, logged by inductor)."""
+        if not (self.sol_cfg.get("compile_step") and x.is_cuda):
+            return self._f
+        if self._compiled_f is None:
+            try:
+                self._compiled_f = torch.compile(self._f, dynamic=False)
+            except Exception:
+                self._compiled_f = self._f
+        return self._compiled_f
+
     def _tau(self, y):
         t0 = self.gating_cfg["tau_0"]
         if self.tau_net is None:
@@ -431,6 +456,15 @@ class AEQMeshNet(nn.Module):
         nfe = 0
         rejects = 0
         final_res = float("nan")
+        f_step = self._solver_f(x)
+        # Convergence test + safeguard need HOST scalars, i.e. a CPU<->GPU sync
+        # that drains the pipeline. check_every>1 evaluates them every k-th
+        # sweep only (always on the last). Tradeoff: a bad Anderson
+        # extrapolation survives up to k-1 sweeps before being reverted (safe,
+        # because rho is bounded by the row-sum cap), and the solve can
+        # overshoot convergence by up to k-1 sweeps -- so large k can COST
+        # more compute than the syncs it saves. 1 == exact old behavior.
+        check_every = max(1, int(cfg.get("check_every", 1)))
 
         for k in range(max_iter):
             # record (pool(z_k), q_k) BEFORE the sweep: this is exactly what
@@ -442,12 +476,26 @@ class AEQMeshNet(nn.Module):
                 traj.append((z.mean(dim=(2, 3, 4)).detach().clone(),
                              q_rec.detach().clone()))
 
-            fz, fy = self._H(z, y, x, q=q)
+            try:
+                fz = f_step(z, y, x)
+            except Exception:
+                if f_step is not self._f:      # compiled twin failed at call
+                    self._compiled_f = f_step = self._f
+                    fz = f_step(z, y, x)
+                else:
+                    raise
+            fy = self._g(y, z, q=q)
             nfe += 1
             rz, ry = fz - z, fy - y
-            res = _block_norm(rz, ry)
-            rel = (res / _state_norm(fz, fy)).item()
-            final_res = rel
+            do_check = (k % check_every == 0) or (k == max_iter - 1)
+            if do_check:
+                # ONE sync per check: residual and state norm in a single
+                # host transfer, so prev_res stays a float and the safeguard
+                # comparison below needs no further device->host traffic.
+                r_abs, s_abs = torch.stack(
+                    [_block_norm(rz, ry), _state_norm(fz, fy)]).tolist()
+                rel = r_abs / max(s_abs, 1e-12)
+                final_res = rel
 
             # residual features for the closed loop (Sec. 3.2)
             if self.read_residual:
@@ -461,23 +509,25 @@ class AEQMeshNet(nn.Module):
                 prev_rnorm = rn
                 q = torch.stack([q1, q2], dim=1).to(y.dtype)
 
-            if rel < cfg["eps"]:
-                z, y = fz, fy
-                break
+            if do_check:
+                if rel < cfg["eps"]:
+                    z, y = fz, fy
+                    break
 
-            # retrospective safeguard: the Anderson candidate we accepted last
-            # sweep made things worse -> revert to the plain step we skipped.
-            if (last_was_anderson and prev_res is not None
-                    and res > prev_res):
-                rejects += 1
-                z_prev_map, y_prev_map = Fh[-1]
-                z = z_prev_map.to(z.dtype)
-                y = y_prev_map.to(y.dtype)
-                Fh, Rh = Fh[-1:], Rh[-1:]
-                last_was_anderson = False
-                prev_res = None
-                continue
-            prev_res = res
+                # retrospective safeguard: the Anderson candidate we accepted
+                # at the last CHECKED sweep made things worse -> revert to the
+                # plain step we stored then. Pure float comparison, no sync.
+                if (last_was_anderson and prev_res is not None
+                        and r_abs > prev_res):
+                    rejects += 1
+                    z_prev_map, y_prev_map = Fh[-1]
+                    z = z_prev_map.to(z.dtype)
+                    y = y_prev_map.to(y.dtype)
+                    Fh, Rh = Fh[-1:], Rh[-1:]
+                    last_was_anderson = False
+                    prev_res = None
+                    continue
+                prev_res = r_abs
 
             # push MAP OUTPUT + normalized residual (Sec. 5.2)
             Fh.append((fz.to(hdt), fy.to(hdt)))
@@ -524,7 +574,8 @@ class AEQMeshNet(nn.Module):
                     r_site = rz.detach().norm(dim=1, keepdim=True) / math.sqrt(self.C)
                     tau = self._tau(y).view(-1, 1, 1, 1, 1)
                     active = (r_site > tau)
-                active_frac_curve.append(float(active.float().mean()))
+                if do_check and self.collect_stats:   # else: one sync per sweep
+                    active_frac_curve.append(float(active.float().mean()))
                 z = torch.where(active, cand_z, z)
             else:
                 z = cand_z
@@ -532,16 +583,20 @@ class AEQMeshNet(nn.Module):
 
         self.stats.update({
             "nfe": nfe,
-            "fwd_rel_res": final_res,
+            "fwd_rel_res": final_res,        # already synced by the last check
             "anderson_rejects": rejects,
             "active_frac_last": active_frac_curve[-1] if active_frac_curve else 1.0,
             "active_frac_curve": active_frac_curve,
-            "y_absmax": float(y.detach().abs().max()),
         })
-        if self.coupling == "mult" and self.gate is not None:
-            g = self._gates(y)
-            self.stats["m_mean"] = float(g.mean())
-            self.stats["m_std_across_batch"] = float(g.mean(dim=(2, 3, 4, 5)).std())
+        # Each of these is a separate device->host sync; only pay for them on
+        # steps the trainer actually logs (see AEQRunner.handle_batch).
+        if self.collect_stats:
+            self.stats["y_absmax"] = float(y.detach().abs().max())
+            if self.coupling == "mult" and self.gate is not None:
+                g = self._gates(y)
+                self.stats["m_mean"] = float(g.mean())
+                self.stats["m_std_across_batch"] = float(
+                    g.mean(dim=(2, 3, 4, 5)).std())
         if record_traj:
             return z, y, traj
         return z, y

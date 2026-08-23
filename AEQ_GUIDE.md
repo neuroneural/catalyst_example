@@ -118,12 +118,19 @@ keeps the same bound.
 7. **Damping form** — with only map outputs kept (halves history memory), the
    β-damping mixes toward the current iterate rather than the doc's stored
    previous iterates. Same fixed point, same safeguard.
-8. **torch.compile is off** — Dynamo cannot trace the data-dependent solver
-   loop or the custom `autograd.Function`; with the repo's suppress-errors
-   default it would *silently* run eager anyway (the failure mode you already
-   documented for DDP). The env vars are set at module scope in
-   `curriculum_training_aeq.py` so the mp.spawn ranks see them too. A later
-   optimization: compile `_f` alone and call it from the eager loop.
+8. **torch.compile: whole-graph off, step compiled** — Dynamo cannot trace
+   the data-dependent solver loop or the custom `autograd.Function`, so the
+   repo-level compile stays force-disabled (env vars at module scope in
+   `curriculum_training_aeq.py` reach the mp.spawn ranks). Instead,
+   `solver.compile_step: true` compiles a twin of `_f` used ONLY inside the
+   no_grad forward solve. This cannot break implicit differentiation: the
+   gradient comes from RBP VJPs against a separate eager evaluation of `H`
+   at the fixed point — the compiled graph only helps *find* z*, never
+   differentiate through it (and a fixed point of the compiled map is a
+   fixed point of the eager map to well within `eps_f`). Expect one
+   recompile at the phase B→C activation switch, and eager fallback (logged
+   by a caught exception) if inductor fails at call time. Phase A unroll,
+   the backward, and the Hutchinson double-backward stay eager by design.
 9. **DDP unused-parameter hazard** — `tau_net`, `y_init` (and `aux_head` when
    λ_aux=0) sit outside the autograd graph; a zero-valued guard term keeps DDP
    from erroring without touching the math.
@@ -235,11 +242,31 @@ Peak *training* memory: `z` (1.07 GB fp32 / 0.54 bf16) + Anderson history
 + stem/head full-res buffers. Comfortably inside an A100-80.
 
 Wall-clock honesty: the doc says 2–4× an explicit baseline; with these
-defaults (≈10 sweeps × 3 convs forward + ~20 joint VJPs backward) expect
-**4–8× per step vs. `gn_hdc_deep`** — and remember the explicit model also
-enjoys torch.compile (~2.5×) which the solver forgoes. `accum_steps` buys
-gradient quality, not throughput. Budget runs accordingly; §6.3 is the lever
-(a lower `rowsum_target` directly cuts `bwd_iters` and permits fewer sweeps).
+defaults expect **4–8× per step vs. `gn_hdc_deep`** (measured: ~2.2 s/it at
+256³ on 4×H100, micro-batch, `accum_steps=4`). Where it goes: ~10 sweeps × 4
+convs forward, plus ~20 RBP iterations each VJP-ing 4 convs, plus the
+Hutchinson double-backward — order **120+ conv-equivalents per step against
+the explicit model's 13**. That is the cost of the architecture, not an
+implementation defect, and GPU power draw (~300 W of 700 W) reflects
+16-channel 3D convs being bandwidth- rather than compute-bound.
+
+The levers, in descending order of effect:
+
+1. **`stability.rowsum_target`** — the design's own §6.3 point: truncation
+   error is `ρ^(K_b+1)/(1-ρ)`, so ρ=0.5 needs ~10 backward iterations where
+   ρ=0.7 needs ~24. Backward is roughly ⅔ of the step, so 0.7 → 0.5 can take
+   ~40% off it/s. Costs expressiveness; watch macro_dice.
+2. **`backward.bwd_amp: true`** — bf16 VJPs, nearly halves backward cost.
+   Check gradient sanity first (`aeq_diagnostics.py`).
+3. **`solver.compile_step`** (default on) — fuses the conv→GN→gate→act chain
+   inside the no-grad solve.
+4. **`solver.check_every`** (default 3) — the convergence test and safeguard
+   need host scalars; each is a pipeline-draining sync. Worth a couple of
+   percent at most, and raising it far *loses* (overshooting convergence
+   costs whole 4-conv sweeps). Verified not to move the fixed point or the
+   gradient: `check_every` 1/2/3 give identical z\*, NFE, and grad cosine.
+
+`accum_steps` buys gradient quality, not throughput.
 
 Peak *inference* memory — the point of the project: the weight-tied trunk
 needs `z` + one conv temp + the injected `x`, independent of sweep count;
