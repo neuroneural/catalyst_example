@@ -150,6 +150,15 @@ class _AEQSolve(torch.autograd.Function):
                 if frozen_z and frozen_y:
                     break
             module.stats["bwd_iters"] = iters
+            # Pinned at the cap => the adjoint is TRUNCATED, not converged.
+            # Unlike the forward, this loop is plain unaccelerated Richardson
+            # (e_{k+1} = J^T e_k), so it needs ~24 iterations at rho=0.7 for
+            # 1e-3 (design Sec. 6.3) and cannot be expected to beat the
+            # Anderson-accelerated forward. If this sits at 1, either lower
+            # stability.rowsum_target (fewer iterations needed) or switch the
+            # adjoint to a Krylov solver, which is the doc's own suggestion.
+            module.stats["bwd_hit_cap"] = (
+                1.0 if iters >= int(bw["max_iter"]) else 0.0)
 
             grads = torch.autograd.grad(
                 (fz, fy), [x_in] + list(params), (lz, ly),
@@ -466,6 +475,15 @@ class AEQMeshNet(nn.Module):
         nfe = 0
         rejects = 0
         final_res = float("nan")
+        # The implicit function theorem applies AT a fixed point. If the solve
+        # exits on the iteration cap instead of the residual test, the RBP
+        # gradient is the exact gradient of an equilibrium we never reached --
+        # a biased gradient whose error scales with the residual. Training
+        # tolerates this (cf. JFB / one-step DEQ gradients), but it must be
+        # VISIBLE: aeq/fwd_converged is the fraction of logged steps that
+        # actually hit eps. If it drifts below 1, either raise solver.max_iter
+        # or lower stability.rowsum_target so the map contracts harder.
+        converged = False
         f_step = self._solver_f(x)
         # Convergence test + safeguard need HOST scalars, i.e. a CPU<->GPU sync
         # that drains the pipeline. check_every>1 evaluates them every k-th
@@ -522,6 +540,7 @@ class AEQMeshNet(nn.Module):
             if do_check:
                 if rel < cfg["eps"]:
                     z, y = fz, fy
+                    converged = True
                     break
 
                 # retrospective safeguard: the Anderson candidate we accepted
@@ -594,6 +613,8 @@ class AEQMeshNet(nn.Module):
         self.stats.update({
             "nfe": nfe,
             "fwd_rel_res": final_res,        # already synced by the last check
+            "fwd_converged": 1.0 if converged else 0.0,
+            "fwd_hit_cap": 1.0 if nfe >= max_iter and not converged else 0.0,
             "anderson_rejects": rejects,
             "active_frac_last": active_frac_curve[-1] if active_frac_curve else 1.0,
             "active_frac_curve": active_frac_curve,
@@ -601,12 +622,27 @@ class AEQMeshNet(nn.Module):
         # Each of these is a separate device->host sync; only pay for them on
         # steps the trainer actually logs (see AEQRunner.handle_batch).
         if self.collect_stats:
-            self.stats["y_absmax"] = float(y.detach().abs().max())
+            ya = y.detach().abs()
+            self.stats["y_absmax"] = float(ya.max())
+            # y = tanh(...), so |y| -> 1 means SATURATION: the local derivative
+            # is 1-y^2 (0.04 at |y|=0.98), gradients to the outer contour
+            # nearly vanish and y sticks at a corner regardless of input --
+            # the persistent-excitation failure of design Sec. 13. Lower
+            # stability.rowsum_target_y to shrink g's pre-activation.
+            self.stats["y_sat_frac"] = float((ya > 0.9).float().mean())
+            self.stats["y_absmean"] = float(ya.mean())
             if self.coupling == "mult" and self.gate is not None:
-                g = self._gates(y)
+                g = self._gates(y)                      # (L, B, C, 1, 1, 1)
                 self.stats["m_mean"] = float(g.mean())
-                self.stats["m_std_across_batch"] = float(
-                    g.mean(dim=(2, 3, 4, 5)).std())
+                self.stats["m_absmax"] = float(g.max())
+                self.stats["m_absmin"] = float(g.min())
+                # Spread of m WITHIN one forward (across layers and channels).
+                # NOTE: this is NOT input dependence -- with per-GPU batch 1
+                # there is no batch axis to vary. The across-INPUT spread is
+                # measured in the trainer by all-reducing m_mean over the DDP
+                # ranks, which each hold a different volume (aeq/m_std_across
+                # _inputs). That is the Sec. 8.2 / Sec. 13 quantity.
+                self.stats["m_std_within"] = float(g.std())
         if record_traj:
             return z, y, traj
         return z, y

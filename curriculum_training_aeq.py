@@ -44,6 +44,12 @@ import curriculum_training_fast as fast
 from aeq_meshnet import AEQMeshNet
 
 
+def out_device(batch):
+    """Device of the batch's sample tensor (for the small collectives)."""
+    s = batch[0] if isinstance(batch, (tuple, list)) else batch
+    return s.device if torch.is_tensor(s) else torch.device("cuda")
+
+
 def _load_aeq_env():
     try:
         return json.loads(os.environ.get("AEQ_CFG_JSON", "{}"))
@@ -267,9 +273,12 @@ class AEQRunner(fast.FastRunner):
         # other step the solver skips them entirely.
         every = int((self.aeq_cfg.get("log", {}) or {}).get("every_n_steps", 20))
         self._aeq_log_step = getattr(self, "_aeq_log_step", 0) + 1
-        want_log = (m.training and self._is_main()
-                    and self._aeq_log_step % max(1, every) == 0)
-        m.collect_stats = want_log
+        # NOTE: want_stats must NOT depend on the rank -- the across-input
+        # measurement below is a COLLECTIVE, so every rank has to reach it.
+        want_stats = (m.training
+                      and self._aeq_log_step % max(1, every) == 0)
+        want_log = want_stats and self._is_main()
+        m.collect_stats = want_stats
         # Amortize the Hutchinson penalty (see AEQMeshNet.jac_every). All ranks
         # use the same step counter, so they agree on which steps pay it --
         # important under DDP, where a rank skipping it would change which
@@ -277,6 +286,25 @@ class AEQRunner(fast.FastRunner):
         m.jac_this_step = (self._aeq_log_step % m.jac_every == 0)
 
         out = super().handle_batch(batch)
+
+        # THE Sec. 8.2 / Sec. 13 measurement: does m(y) vary ACROSS INPUTS?
+        # Each DDP rank holds a different volume, so the spread of m_mean over
+        # ranks is a real across-input spread -- free, and impossible to get
+        # from one rank at per-GPU batch 1. Near-zero => y is input-independent
+        # and the outer contour is decorative (Bet 1 fails), whatever the task
+        # metric says. Confirm with aeq_diagnostics.py's coupling_norm.
+        m_spread = None
+        if want_stats and "m_mean" in m.stats:
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    v = torch.tensor([m.stats["m_mean"]], device=out_device(batch))
+                    buf = [torch.zeros_like(v) for _ in range(dist.get_world_size())]
+                    dist.all_gather(buf, v)
+                    vals = torch.cat(buf)
+                    m_spread = float(vals.std()) if vals.numel() > 1 else 0.0
+            except Exception:
+                m_spread = None
 
         # wandb-only diagnostics (off the tqdm bar)
         if want_log:
@@ -289,6 +317,8 @@ class AEQRunner(fast.FastRunner):
                     curve = s.get("active_frac_curve") or []
                     if curve:
                         log["aeq/active_frac_mean"] = sum(curve) / len(curve)
+                    if m_spread is not None:
+                        log["aeq/m_std_across_inputs"] = m_spread
                     log.update({f"aeq/{k}": v
                                 for k, v in m.rowsum_report().items()})
                     if torch.cuda.is_available():
