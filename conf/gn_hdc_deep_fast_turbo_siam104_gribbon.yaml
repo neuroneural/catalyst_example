@@ -1,0 +1,448 @@
+# =============================================================================
+# ARM: marginalized ribbon losses on the 104-class model.
+#   python curriculum_training_fast.py --config-dir=conf \
+#          --config-name=gn_hdc_deep_fast_turbo_siam104_gribbon
+#
+# WHAT THIS IS. A short warm-started fine-tune of the 104-class model that adds
+# TWO auxiliary loss terms computed in 18-GROUP space (cortex = one class again)
+# on top of the unchanged 104-class CE + generalized Dice. Nothing else moves:
+# same data, same model, same schedule shape, same export. Train-only, so the
+# deployed head and its WebGPU peak memory are byte-identical.
+#
+# WHY, measured (2026-09-08, error_attrib.py on the epoch_00150 spool of
+# infant104_gn_hdc_deep_turbo24, 8 real MRN subjects WITH ground truth):
+#   as-measured cortical parcel Dice ............ 0.724
+#   collapsed cortex-as-ONE-class Dice .......... 0.866
+#   counterfactual, every lateral choice fixed .. 0.861   <- ribbon error alone
+#   counterfactual, ribbon mask fixed ........... 0.833   <- lateral error alone
+#   => the deficit splits ~45% RIBBON / ~55% LATERAL.
+# Voxel accounting on the GT cortical ribbon: 76.2% right parcel, 11.8% cortex
+# but wrong parcel, 12.0% not called cortex at all, plus a 15.3% over-call of
+# which only 1% lies outside the brain (so: no dura problem). Of predicted-
+# cortex voxels, 7.6% are truly background and 7.0% are truly cerebral WM --
+# the ribbon is FAT on BOTH sides, about equally.
+#
+# This arm attacks the 45% ribbon half. It cannot touch the lateral half: 99% of
+# wrong-parcel voxels go to an IPSILATERAL NEIGHBOUR (contralateral is 1.0%,
+# homolog 0.9%), i.e. adjacent gyri whose mutual boundary is an atlas convention
+# with no image evidence. No loss fixes that; do not judge this arm on it.
+#
+# WHY MARGINALIZED and not per-parcel. In 104-space cortex is 68 parcels whose
+# mutual borders carry no image evidence, so a per-parcel Tversky fights an
+# arbitrary boundary and a per-parcel clDice skeletonizes a patch of a sheet.
+# Also 103 foreground classes through clDice's per-class checkpoint loop is
+# ~6x the 18-class cost on a model that already needs activation checkpointing.
+# Marginalizing to the 18 tissue groups puts the pressure exactly on the
+# cortex/WM and cortex/exterior surfaces, on a tensor 18/104 the size.
+#
+# THE TERMS (indices below are GROUP ids, not 104-class ids):
+#   group Tversky, alpha > beta, on the SHEETS 2=Cortex, 6=CerebCortex.
+#     Precision-favouring: penalises false positives harder, so a fat ribbon is
+#     pushed back on both of its surfaces.
+#   group clDice on the THIN structures 1=WM(+CC), 3=LatVent, 4=InfLatVent,
+#     5=CerebWM, 11=3rdVent, 12=4thVent, 13=BrainStem.
+#     Sheets are deliberately EXCLUDED: clDice resists thinning, which
+#     over-thickens a sheet and merges sulci -- the wrong direction here.
+#
+# This one arm also covers two other measured findings:
+#   cerebellum outline is already 0.956 collapsed but the cerebellar WM/cortex
+#     split inside it is wrong 10.7% of the time -> Tversky on 6 + clDice on 5.
+#   ventricles are geometry not label-swapping (0.3% in-group swaps); the weak
+#     ones are the thin ones, 88 L-Inf-Lat-Vent Dice 0.467 HD95 9.8 and 90
+#     R-Inf-Lat-Vent 0.563 HD95 11.2 -> group 4 clDice.
+#
+# BACKWARD COMPATIBILITY. Every key added here is new and defaults to inert.
+# With model.group_lut absent, or the two group weights at 0.0, CEDiceLoss is
+# BITWISE identical to before (loss and gradient) -- asserted by
+# test_group_marginalize.py, 30/30 on CPU. No existing config is touched.
+#
+# GENERATOR PAIRING. Run this against a wirehead db filled from
+# mrn_babyseg/config.labelfused104.ribbon.yaml, which lowers hires_sigma
+# 0.7 -> 0.45. Measured on real labelfused104: at sigma 0.7 the generator's own
+# label smoothing thickens the cortical ribbon by +4.8% (2V/S 1.84 -> 1.93 mm)
+# and closes 1.5-3.0% of the sulcal space, i.e. the TARGET is fatter than the
+# GT this run is scored against. At 0.45 that bias drops to +1.5%. Training
+# this arm against a sigma-0.7 db means the Tversky term spends part of its
+# gradient fighting the target. Same DBNAME, so databases_code below is
+# unchanged -- drop and refill the db (command in that config's header).
+#
+# LAUNCH (note FAST_COMPILE_LOSS=0 -- see model.loss_log_terms below):
+#   MALLOC_TRIM_THRESHOLD_=0 MALLOC_ARENA_MAX=2 FAST_COMPILE_LOSS=0 \
+#   python curriculum_training_fast.py --config-dir=conf \
+#          --config-name=gn_hdc_deep_fast_turbo_siam104_gribbon
+#
+# HOW TO READ IT AS IT UNFOLDS (this is why loss_log_terms and keep_spool are
+# on). In wandb, lossterm_*_batch/train gives ce / dice / group_tversky /
+# group_cldice / total separately:
+#   group_tversky falling while ce and dice hold  -> the arm is working.
+#   ce climbing while group_tversky falls         -> the aux weight is too high,
+#                                                    halve group_tversky_weight.
+#   group_cldice flat from step 1                 -> check the GROUP class list.
+# Every 2 epochs real_eval writes real_eval/epoch_NNNNN/{per_class.csv,
+# summary.json} AND keeps its spool, so:
+#   python error_attrib.py --spool <logdir>/real_eval/epoch_00002/spool
+# gives the ribbon/lateral split for that round. The number to watch is
+# COLLAPSED CORTEX DICE (0.866 at the start), not 104-class macro Dice, which
+# is dominated by the 68 parcels this arm cannot help.
+#
+# EXPECTED SHAPE OF THE RESULT. Ribbon deficit is 0.139 of the 0.276 total.
+# Recovering even a third of it moves collapsed cortex Dice ~0.866 -> ~0.91 and
+# 104-class macro Dice by only ~0.01-0.02. That is a WIN, and it will look tiny
+# in the headline metric. 30 epochs, not 150: this is a boundary reshape from a
+# converged checkpoint, not a climb from the floor.
+#
+# IF IT OOMS. The 104-class terms already need use_checkpoint True +
+# checkpoint_segments 2. The group terms add ~1.4 GB (the [1,18,256^3] fp32
+# group tensor) plus ~1.1 GB transient inside clDice's backward. First lever:
+# group_cldice_downsample: 2 (8x smaller skeleton tensors). Second:
+# group_cldice_iters: 3. Third: group_cldice_weight: 0.0 and run the Tversky
+# term alone -- it is the cheap one and the one aimed at the fat ribbon.
+# Smoke-test with experiment.epochs_code "[1] * maxreps" before the real run.
+#
+# -----------------------------------------------------------------------------
+# Everything below is inherited from gn_hdc_deep_fast_turbo_siam.yaml; its own
+# header notes are kept where they still apply.
+# =============================================================================
+
+mongo:
+  # SynthSeg generator served via wirehead -> db "synth18", collection "read".
+  # (Pointing at MindfulTensors/MRN returns empty records -> mytransform "0 bytes".)
+  host: "10.245.12.58"
+  host_slurm: "10.245.12.58"   # wirehead/synth18 endpoint; verify if running under SLURM
+  dbname: "synth104"
+  collection: "read"
+  index_id: "id"
+  labelfield: "label"
+  datafield: "data"
+  validation_percent: 0.1
+
+wandb:
+  team: "neuroneural"
+  project: "synth104"
+
+bit16: True
+
+perf:
+  verbose: False
+  cudnn_benchmark: True
+  tf32: True
+  channels_last: True     # ON: GN is a fused triton kernel once compile works, so
+                          # NHWC no longer thrashes the norm and bf16 convs run
+                          # NHWC on the tensor cores (~8% faster). Under multi-GPU
+                          # DDP this yaml value only sets the launcher; the spawned
+                          # ranks read FastRunner's class default (True) / the
+                          # FAST_CHANNELS_LAST env var instead -- already True, so
+                          # no action needed, just don't set FAST_CHANNELS_LAST=0.
+  compile: True
+  compile_mode: "default"   # reduce-overhead gave 0 speedup (util already ~100%).
+                             # To try inductor conv-algo autotune: FAST_COMPILE_MODE=max-autotune
+  ddp_batch_sync: True
+  profile: False                 # one-shot torch.profiler. Enable per-run for DDP with
+  profile_steps: 10              # FAST_PROFILE=1 (yaml value doesn't reach mp.spawn ranks).
+  amp_dtype: "bfloat16"          # "float16" (old default) | "bfloat16"
+
+model:
+  n_classes: 104
+  model_channels: 24
+  model_label: "_gn_hdc_deep_24_gribbon"
+  config_file: "./modelAE_hdc_deep.json"
+  volume_shape: [256, 256, 256]
+  maxshape: 300
+  optimize_inline: False
+  use_groupnorm: True
+  use_affine: True
+  use_me: False
+  use_se: False
+  # False hard-OOMs on this 24ch/13-layer/104-class model at 256^3 (full
+  # activations retained for backward) -- keep True + checkpoint_segments.
+  use_checkpoint: True
+  checkpoint_segments: 2
+  checkpoint_keep_layers: 0
+  loss_weight: [0.5, 0.5]
+  label_smoothing: 0.01
+  dice_generalized: True
+  loss_fused: True
+
+  # --- MARGINALIZED (18-group) auxiliary terms -------------------------------
+  # group_lut maps each of the 104 classes to one of 18 groups. "lut104_to_18"
+  # is the builtin in dice.py, asserted identical to
+  # predict_samples_siam.lut104_to_18(). An explicit 104-entry list also works.
+  # OMIT this key (or set both weights to 0.0) to get the old loss, bitwise.
+  group_lut: lut104_to_18
+
+  # Precision-favouring Tversky on the SHEETS. GROUP ids: 2 = Cortex,
+  # 6 = CerebCortex. alpha > beta penalises false positives harder, which is
+  # what un-fattens a ribbon.
+  #
+  # alpha/beta = 0.6/0.4 (ratio 1.5), NOT the 18-class run's 0.7/0.3 (ratio
+  # 2.33). Two reasons, both measured: (a) the actual over-call/miss imbalance
+  # is 15.3%/12.0% = 1.28, so 1.5 already pushes harder than the error asks for
+  # and 2.33 risks overshooting into a thin, holey ribbon; (b) the generator
+  # sets p_low_contrast 0.2 with a [CerebralWM <-> Cortex] tie, so in a fifth of
+  # samples the GM/WM step is measured at 0.04x noise -- the inner boundary is
+  # simply not in the image, and a hard FP penalty there teaches the model to
+  # shrink cortex on faith. If collapsed cortex Dice moves less than 0.01 by
+  # epoch 10, raise to 0.70/0.30 (the proven 18-class value). If the ribbon
+  # goes thin or holey, drop alpha toward 0.5.
+  group_tversky_weight: 0.30
+  group_tversky_alpha: 0.60
+  group_tversky_beta: 0.40
+  group_tversky_classes: [2, 6]
+
+  # clDice on the THIN structures only. GROUP ids: 1 = cerebral WM (+ corpus
+  # callosum, which marginalizes into it), 3 = LatVent, 4 = InfLatVent,
+  # 5 = CerebWM, 11 = 3rdVent, 12 = 4thVent, 13 = BrainStem.
+  # Sheets 2 and 6 are EXCLUDED on purpose (see the header).
+  # The 18-class winner used all-but-sheets, [1,3,4,5,7,8,9,10,11,12,13,14,
+  # 15,16,17]. This narrows it on measured evidence: subcortex 69-84 is already
+  # at 0.869 per-label with 1.6% in-group swaps, and clDice averages over its
+  # class list, so eight near-zero terms would halve the gradient reaching the
+  # classes that actually need it. Swap in the wider list to reproduce the
+  # proven recipe exactly.
+  group_cldice_weight: 0.10
+  group_cldice_iters: 5
+  group_cldice_downsample: 1    # 1 = full-res skeleton, the POINT of clDice.
+                                # 2 if memory is tight (8x smaller, coarsens
+                                # exactly the thin structures it protects).
+  group_cldice_include_bg: false
+  group_cldice_classes: [1, 3, 4, 5, 11, 12, 13]
+
+  # Per-term loss breakdown -> wandb only, never the tqdm bar, as
+  # lossterm_{ce,dice,group_tversky,group_cldice,total}_batch/<loader>.
+  # Writing the terms to self inside forward is a side effect that breaks a
+  # compiled graph, so LAUNCH WITH FAST_COMPILE_LOSS=0. That costs ~8% of a
+  # step in principle, but clDice's per-class checkpoint loop already
+  # graph-breaks the criterion, so with these terms on there is little left to
+  # lose. Set false to get the compiled loss back.
+  loss_log_terms: true
+
+  use_refiner: False
+  # EMA swaps in averaged weights for VALIDATION + the checkpoint save only; it
+  # never touches the macro_dice_batch/train curve (training always uses raw
+  # weights). Judge it on macro_dice/valid, not train. Free at inference (no
+  # extra params/compute -- just which weights get exported).
+  use_ema: True
+  ema_decay: 0.999
+
+paths:
+  loadcheckpoint: True
+  # WARM START INTO A NEW DIRECTORY, so infant104_gn_hdc_deep_turbo24 is never
+  # overwritten and stays available as the control to diff against.
+  #
+  # Starting from the INFANT lineage, not synth104_..._fromreal_fused: this is
+  # the run whose error was actually measured, and it is the one trained on the
+  # current generator distribution (labelfused104.gentle, infant low-contrast
+  # regime). Its CSF class 93 is degraded (Dice 0.148 vs the fused run's 0.580)
+  # but that was measured NOT to be a ribbon lever: only 9.6% of GT class-93
+  # voxels sit within 3 mm of cortex, and the 1-voxel shell just outside the GT
+  # ribbon is 49.8% background / 50.0% cerebral WM / 0.0% CSF. There is no CSF
+  # class between cortex and the outside in this target at all, which is exactly
+  # why the Tversky precision term is the only in-target signal for that
+  # surface.
+  #
+  # CONSEQUENCE: this is not self-resuming. If the job is killed and
+  # resubmitted it rewinds to the warm start. After the first launch succeeds,
+  # repoint `model` at
+  #   ./logs/tmp/gribbon104_gn_hdc_deep_turbo24/model.last.pth
+  # to make restarts continue instead of restart. A first launch finds no
+  # checkpoint under logdir, which is fine: Catalyst's resume reads `model`.
+  model: "./logs/tmp/infant104_gn_hdc_deep_turbo24/model.last.pth"
+  logdir: "./logs/tmp/gribbon104_gn_hdc_deep_turbo24/"
+
+client_creator:
+  crop_tensor: False
+
+dataloader:
+  num_workers: 12
+  prefetch_factor: 4
+  valid_prefetch_factor: 2
+  # true = long-lived workers (no per-epoch respawn + Mongo reconnect pause).
+  # REQUIRES taming the glibc allocator or the workers' malloc arenas creep and
+  # leak host RAM across the run (documented OOM-kill at ~epoch 27 without
+  # this). Launch with:
+  #   MALLOC_TRIM_THRESHOLD_=0 MALLOC_ARENA_MAX=2 python curriculum_training_fast.py ...
+  # (or LD_PRELOAD a jemalloc/tcmalloc). If your launch script can't guarantee
+  # those env vars are set BEFORE the python process starts, set this back to
+  # false rather than risk a mid-run OOM-kill.
+  persistent_workers: true
+
+metrics:
+  dice_every_n_steps: 10
+  dice_subsample_stride: 4
+
+# Periodic real-data (MindfulTensors/MRN) boundary-metric eval -- Dice, Surface
+# Dice (NSD), HD95, ASSD, per-structure + worst-case tail -- run every
+# `every_n_epochs` epochs instead of every epoch (too expensive at 256^3).
+#
+# Two phases (see real_eval_ddp.py / real_eval_reduce.py):
+#   1. GPU, ON the critical path but DDP-SHARDED: every rank infers its own
+#      ids[rank::world_size] slice with the LIVE model. No checkpoint reload, no
+#      second CUDA context, no collectives added to the loop. 24 subjects on 4
+#      GPUs = 6 forwards per rank. Labels are cropped to the foreground box and
+#      spooled to disk as uint8.
+#   2. CPU, OFF the critical path: rank 0 launches a detached, CUDA-free, nice'd
+#      reducer that runs the distance transforms in a multiprocessing pool while
+#      the next epoch trains. Results land in <logdir>/real_eval/epoch_NNNNN/
+#      (per_class.csv + summary.json), get appended to real_eval/history.csv,
+#      and are logged to the live wandb run by the callback on a later epoch.
+#
+# --- what the `valid` loader actually holds -----------------------------------
+# WITHOUT this block, curriculum_training falls back to its legacy path:
+# MongoheadDataset(range(32)) against the TRAINING db -- i.e. validation on
+# synthetic samples drawn from the same wirehead stream as training. Every
+# number it produces is in-distribution by construction, so `macro_dice/valid`
+# measures how well the model fits the simulator, and the CheckpointCallback
+# (metric_key=macro_dice, loader_key=valid, minimize=False) selects
+# model.best.pth on that. Best-model selection is then meaningless for real
+# scans, which is the only thing this model is for.
+#
+# Pointing it at real MindfulTensors/MRN makes both meaningful at once: the
+# reported metric and the checkpoint chosen by it.
+#
+# labelfield is labelfused104, NOT label104. The model is now trained against
+# the transplanted target -- labelfused geometry for cerebellum (95-98) and
+# subcortex (69-84), label104 for cortex. Scoring against plain label104 would
+# grade the model DOWN for exactly the cerebellar and subcortical improvements
+# the transplant was built to introduce.
+#
+# num_subjects <= the generator's SOURCE.HOLDOUT_FIRST in
+# config.labelfused104.gentle.yaml (32). Both sides take the LOWEST ids, so
+# those subjects are reserved and never synthesized from. If you raise this,
+# raise HOLDOUT_FIRST too and refill the wirehead db -- otherwise validation
+# silently starts scoring subjects the model was trained on.
+validation:
+  host: "10.245.12.58"        # MindfulTensors, not the wirehead endpoint
+  db: "MindfulTensors"
+  collection: "MRN"
+  datafield: "T1"
+  labelfield: "labelfused104"
+  num_subjects: 32
+  # OFF on purpose. These metrics are scipy distance transforms and they run
+  # SYNCHRONOUSLY inside the valid loop, on the critical path. real_eval below
+  # already computes NSD/HD95/ASSD over the same MRN subjects every 3 epochs in
+  # a detached, nice'd CPU process that training never waits for -- so turning
+  # this on buys nothing and costs epoch time. Leave the valid loader cheap:
+  # plain Dice is all the checkpointer needs, and it is what selects
+  # model.best.pth.
+  surface_metrics: false
+  surface_every_n_epochs: 5   # moot while surface_metrics is false
+  nsd_tau: 1.0
+  spacing: [1.0, 1.0, 1.0]    # conformed 1mm isotropic
+  fail_dice: 0.5              # per-subject failure threshold (the tail, not the mean)
+
+# label104 is MRN's native dense-atlas field. NOT what this model predicts any
+# more -- see the labelfield note under `validation:` above.
+real_eval:
+  enabled: True
+  # Counted ACROSS restarts (persisted in <logdir>/real_eval/epochs_seen), so
+  # this is not defeated by the 4h SLURM slices. Keep it <= epochs-per-job for
+  # the first few runs so you actually see it fire: at ~35 min/epoch a 4h job is
+  # ~6 epochs, so 3 gives you two rounds per job.
+  # 2, not 3: this is a 30-epoch arm and the whole point is to watch the ribbon
+  # move, so trade a little wall clock for 15 rounds instead of 10. The GPU
+  # phase is DDP-sharded (24 subjects / 4 GPUs = 6 forwards per rank) and the
+  # CPU phase overlaps the next epoch, so a round costs ~one extra forward pass
+  # per rank.
+  every_n_epochs: 2
+  max_subjects: 24          # truncated down to a multiple of world_size
+  collection: "MRN"
+  labelfield: "labelfused104"   # was label104 -- see the note above
+  datafield: "T1"
+  tau: 1.0
+  spacing: "1,1,1"
+  fail_dice: 0.5
+  exclude_classes: ""       # e.g. "16,17": kept per-class, dropped from macro
+  num_workers: 2            # PER RANK, non-persistent -- keep small, these hold
+  prefetch_factor: 2        # Mongo clients alongside the training loader's 12
+  amp: true                 # infer under the training autocast dtype
+  jobs: 0                   # reducer pool size; 0 => cores - (num_workers + 2)
+  nice: 10                  # reducer yields to the training dataloader
+  spool_dir: null           # default <logdir>/real_eval/epoch_NNNNN/spool;
+                            # point at node-local scratch if logdir is on NFS
+  # TRUE for this arm: the reducer's per_class.csv gives Dice/NSD/HD95/ASSD but
+  # NOT the ribbon-vs-lateral split, which needs the raw {pred,gt} pair. Keeping
+  # the spool lets error_attrib.py run on any round after the fact:
+  #   python error_attrib.py --spool <logdir>/real_eval/epoch_00002/spool
+  # Cost: ~8 MB x 24 subjects x 15 rounds ~= 2.9 GB under logdir. Set false once
+  # the arm is characterised. (real_eval_ddp._reap_previous_job now respects
+  # this flag: with keep_spool on, a job restart only reaps spools whose round
+  # never produced a summary.json, so a kept spool survives a resubmit.)
+  keep_spool: true
+  compress: false           # savez_compressed: ~4x smaller, ~10x slower write
+  timeout_s: 1800           # reducer stops waiting for a dead rank
+
+experiment:
+  # max_lr = 8 * lr_scale / 256 (single rep -> no 0.8^rep attenuation).
+  # lr_scale 0.15 -> max_lr ~= 0.0047 (vs the old run's productive ~0.0026). That
+  # peak is hot; with the warmup fix below it now ANNEALS instead of staying
+  # pinned, so 0.15 may be fine. If the curve stays noisy/flat, drop to 0.10
+  # (~0.0031) -- that isolates "hot LR" from "too-long warmup".
+  # 0.05, a quarter of the base config's 0.2 (max_lr ~= 0.0016). This is a
+  # BOUNDARY RESHAPE from a converged checkpoint, not a climb: the 18-class
+  # chain that won did exactly this, short warm-started fine-tunes at lr_scale
+  # 0.05-0.1 off an already-good model. A hot LR here would relearn the whole
+  # map and throw away the thing being refined.
+  lr_scale: 0.05
+  # CRITICAL for a single long run: pct_start is the fraction of the WHOLE cycle
+  # spent warming up. At 0.1 over 150 epochs that's ~75k steps pinned at peak LR
+  # (the flat/noisy plateau you saw). 0.02 reaches peak fast, then anneals for
+  # the rest -- which is where dice actually climbs. (~15k-step warmup here.)
+  # 0.05 over 30 epochs is a ~2.3k-step warmup, then anneal. (0.02 is the
+  # 150-epoch number; as a FRACTION it would give a 900-step warmup here, too
+  # abrupt for a freshly-added loss term.)
+  pct_start: 0.05
+  # Decoupled weight decay. > 0 auto-switches the optimizer Adam->AdamW and
+  # applies decay to CONV WEIGHTS ONLY (GroupNorm gamma/beta + biases excluded
+  # in get_optimizer). Keeps conv-weight/activation magnitudes down so the
+  # exported model stays fp16-safe for WebGPU. Resume loads MODEL WEIGHTS ONLY
+  # (no optimizer state), so switching Adam->AdamW on a resumed checkpoint is
+  # safe. CLI override: experiment.weight_decay=1e-2
+  weight_decay: 1.0e-2
+  # Gradient clipping (total norm). Bounds an occasional outlier batch so it
+  # can't knock the model into a transient train-dice collapse. A non-finite
+  # norm (NaN/Inf) SKIPS the step entirely. bf16 needs no unscale, runs
+  # directly. 0 to disable. CLI override: experiment.grad_clip=2.0
+  grad_clip: 1.0
+  # effective batch = numvolumes * accum_steps = 1 * 8 = 8, memory-neutral
+  # (does NOT raise it/s or power -- just smooths the gradient / lets the LR
+  # run hotter). Was silently 1 here despite the header always having said 8.
+  accum_steps: 8
+  maxreps: 1                     # single long run (was 10 reps of LR thrash)
+  cubesizes_code: |
+    [256] * maxreps
+  numcubes_code: |
+    [1] * maxreps
+  numvolumes_code: |
+    [1] * maxreps
+  weights_code: |
+    [1] * maxreps
+  databases_code: |
+    ["wirehead_mrn_gentle"] * maxreps
+  collections_code: |
+    ["read"] * maxreps
+  dbfields_code: |
+    [("data", "label")] * maxreps
+  epochs_code: |
+    [30] * maxreps   # boundary reshape, not a climb. The aux terms act on
+                     # surfaces that are already roughly right, so the signal
+                     # shows early: expect movement in lossterm_group_tversky
+                     # within 2-3 epochs and in collapsed cortex Dice by
+                     # epoch 6-10. If nothing has moved by epoch 10, the
+                     # weights are too low -- stop and raise them rather than
+                     # spending 30 epochs. Smoke-test with [1] * maxreps first.
+                     # (Kept from the base config, still true:)
+                     # warm-start refinement, NOT a climb from the floor.
+                     # 150 is the from-scratch number. This run resumes from
+                     # synth104_..._fromreal_fused, which is already strong on
+                     # adults; the target layout did not change (still the same
+                     # 104 DK classes), so the whole network transfers and only
+                     # the input distribution moved -- CSF at id 108, the pial
+                     # rind, wider noise, low-contrast ties. That needs one
+                     # warmup+anneal. pct_start is a FRACTION of the cycle, so
+                     # the schedule stays correctly shaped at any length.
+                     # epochs is the only real wall-clock lever (compute-bound:
+                     # time ~= epochs x ~4800 volumes).
+  prefetches_code: |
+    [24] * maxreps
+  attenuates_code: |
+    [0.8] * maxreps
