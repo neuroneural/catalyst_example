@@ -223,6 +223,67 @@ def tversky_loss_from_probs(probs, targets, classes=None, alpha=0.7, beta=0.3,
     return total / len(class_list)
 
 
+# ---------------------------------------------------------------------------
+# Group marginalization for the auxiliary shape / topology terms.
+#
+# Why: at 104 classes the cortex is 68 PARCELS whose mutual boundaries are atlas
+# conventions with no image evidence, so a per-parcel Tversky fights an arbitrary
+# boundary and a per-parcel clDice skeletonizes a patch of a sheet. Marginalizing
+# to the 18 tissue/structure groups puts the same shape pressure exactly where
+# image evidence exists (cortex/WM and cortex/exterior), costs an 18-class loop
+# instead of a 103-class one on a tensor 18/104 the size, and is TRAIN-ONLY: the
+# deployed 104-class head and its peak memory are untouched.
+#
+# Measured 2026-09-08 on real MRN with GT (error_attrib.py): collapsed cortex
+# Dice 0.866 vs per-parcel 0.724, and the predicted ribbon is FAT on both sides
+# (7.6% of predicted cortex is truly background, 7.0% is truly cerebral WM)
+# against a 12.0% miss -- an over-call/miss ratio of only ~1.28, which is why
+# alpha/beta ~ 1.5 is the right starting push and 2.33 (0.7/0.3) likely
+# overshoots into under-call.
+# ---------------------------------------------------------------------------
+
+# lut[104-class id] -> 0..17 group. MUST stay identical to
+# predict_samples_siam.lut104_to_18(); test_group_marginalize.py asserts it.
+GROUP_LUT_104_TO_18 = (
+    [0]                      # 0   background
+    + [2] * 68               # 1-68   ctx-lh-* (1-34) + ctx-rh-* (35-68) -> Cortex
+    + [7, 7]                 # 69,70  thalamus
+    + [8, 8]                 # 71,72  caudate
+    + [9, 9]                 # 73,74  putamen
+    + [10, 10]               # 75,76  pallidum
+    + [14, 14]               # 77,78  hippocampus
+    + [15, 15]               # 79,80  amygdala
+    + [16, 16]               # 81,82  accumbens
+    + [17, 17]               # 83,84  ventralDC
+    + [1, 1]                 # 85,86  cerebral white matter
+    + [3, 4, 3, 4]           # 87-90  lateral / inf-lat ventricle (L,R)
+    + [11]                   # 91     3rd ventricle
+    + [12]                   # 92     4th ventricle
+    + [0]                    # 93     CSF -> background in 18-space
+    + [13]                   # 94     brain stem
+    + [5, 5]                 # 95,96  cerebellum white matter
+    + [6, 6]                 # 97,98  cerebellum cortex
+    + [1] * 5                # 99-103 corpus callosum -> white matter
+)
+
+GROUP_LUTS = {"lut104_to_18": GROUP_LUT_104_TO_18}
+
+
+def marginalize_probs(probs, lut, n_groups):
+    """Sum class probabilities into super-class probabilities.
+
+    probs : [B, C, *spatial] softmax probabilities
+    lut   : [C] long, lut[c] = group index of class c
+    ->      [B, n_groups, *spatial]
+
+    index_add over the class axis rather than an einsum with a [C, G] matrix:
+    same result, one kernel, and no [C, G] operand. Differentiable through
+    `probs` (the backward is a gather).
+    """
+    out = probs.new_zeros((probs.shape[0], int(n_groups)) + tuple(probs.shape[2:]))
+    return out.index_add(1, lut, probs)
+
+
 def faster_dice(x, y, labels, fudge_factor=1e-8):
     """Faster PyTorch implementation of Dice scores.
     :param x: input label map as torch.Tensor
@@ -347,7 +408,14 @@ class CEDiceLoss(torch.nn.Module):
                  cldice_weight=0.0, cldice_iters=5, cldice_downsample=1,
                  cldice_include_bg=False, cldice_classes=None,
                  tversky_weight=0.0, tversky_alpha=0.7, tversky_beta=0.3,
-                 tversky_classes=None):
+                 tversky_classes=None,
+                 group_lut=None, group_n_classes=None,
+                 group_cldice_weight=0.0, group_cldice_iters=5,
+                 group_cldice_downsample=1, group_cldice_include_bg=False,
+                 group_cldice_classes=None,
+                 group_tversky_weight=0.0, group_tversky_alpha=0.6,
+                 group_tversky_beta=0.4, group_tversky_classes=None,
+                 log_terms=False):
         super(CEDiceLoss, self).__init__()
         self.w_ce, self.w_dice = float(loss_weight[0]), float(loss_weight[1])
         if class_weight is not None and not torch.is_tensor(class_weight):
@@ -373,6 +441,46 @@ class CEDiceLoss(torch.nn.Module):
         self.tversky_alpha = float(tversky_alpha)
         self.tversky_beta = float(tversky_beta)
         self.tversky_classes = list(tversky_classes) if tversky_classes else None
+        # --- MARGINALIZED (group-space) aux terms. All default 0.0 / None, so
+        # a CEDiceLoss built without them is byte-identical to before. ---
+        if group_lut is not None and not torch.is_tensor(group_lut):
+            group_lut = torch.as_tensor(list(group_lut), dtype=torch.long)
+        if group_lut is not None:
+            group_lut = group_lut.to(torch.long)
+        self.register_buffer("group_lut", group_lut)
+        self.group_n_classes = (
+            int(group_n_classes) if group_n_classes is not None
+            else (int(group_lut.max().item()) + 1 if group_lut is not None else 0)
+        )
+        self.group_cldice_weight = float(group_cldice_weight)
+        self.group_cldice_iters = int(group_cldice_iters)
+        self.group_cldice_downsample = int(group_cldice_downsample)
+        self.group_cldice_include_bg = bool(group_cldice_include_bg)
+        self.group_cldice_classes = (list(group_cldice_classes)
+                                     if group_cldice_classes else None)
+        self.group_tversky_weight = float(group_tversky_weight)
+        self.group_tversky_alpha = float(group_tversky_alpha)
+        self.group_tversky_beta = float(group_tversky_beta)
+        self.group_tversky_classes = (list(group_tversky_classes)
+                                      if group_tversky_classes else None)
+        if (self.group_cldice_weight != 0.0 or self.group_tversky_weight != 0.0) \
+                and self.group_lut is None:
+            raise ValueError(
+                "group_cldice_weight/group_tversky_weight > 0 need group_lut "
+                "(e.g. model.group_lut: lut104_to_18)"
+            )
+        # Per-term values of the LAST forward, detached, for logging only. Never
+        # read by the training math. Off by default: writing to self inside
+        # forward is a side effect that breaks a torch.compile graph, so runs
+        # with log_terms=True should set FAST_COMPILE_LOSS=0 (the aux terms
+        # already graph-break on their per-class checkpoint loop anyway).
+        self.log_terms = bool(log_terms)
+        self._terms = {}
+
+    def _group_on(self):
+        return (self.group_lut is not None
+                and (self.group_cldice_weight != 0.0
+                     or self.group_tversky_weight != 0.0))
 
     def _ce(self, log_probs, targets, C):
         eps = self.label_smoothing
@@ -393,32 +501,81 @@ class CEDiceLoss(torch.nn.Module):
         C = inputs.shape[1]
         log_probs = torch.log_softmax(inputs.float(), dim=1)   # single big tensor
         loss = inputs.new_zeros(())
+        terms = {} if self.log_terms else None
         if self.w_ce != 0.0:
-            loss = loss + self.w_ce * self._ce(log_probs, targets, C)
+            _t = self._ce(log_probs, targets, C)
+            loss = loss + self.w_ce * _t
+            if terms is not None:
+                terms["ce"] = _t.detach()
         # probs reused by Dice, boundary and clDice terms -> one exp() at most.
         _need_probs = (self.w_dice != 0.0 or self.boundary_weight != 0.0
-                       or self.cldice_weight != 0.0 or self.tversky_weight != 0.0)
+                       or self.cldice_weight != 0.0 or self.tversky_weight != 0.0
+                       or self._group_on())
         probs = log_probs.exp() if _need_probs else None
         if self.w_dice != 0.0:
-            loss = loss + self.w_dice * soft_dice_from_probs(
+            _t = soft_dice_from_probs(
                 probs, targets, self.dice_smooth,
                 self.generalized, self.gdl_eps,
             )
+            loss = loss + self.w_dice * _t
+            if terms is not None:
+                terms["dice"] = _t.detach()
         if self.boundary_weight != 0.0:
-            loss = loss + self.boundary_weight * boundary_loss_from_probs(
+            _t = boundary_loss_from_probs(
                 probs, targets, self.boundary_radius, self.boundary_include_bg,
                 self.boundary_downsample,
             )
+            loss = loss + self.boundary_weight * _t
+            if terms is not None:
+                terms["boundary"] = _t.detach()
         if self.cldice_weight != 0.0:
-            loss = loss + self.cldice_weight * cldice_loss_from_probs(
+            _t = cldice_loss_from_probs(
                 probs, targets, self.cldice_iters, self.cldice_include_bg,
                 self.cldice_downsample, classes=self.cldice_classes,
             )
+            loss = loss + self.cldice_weight * _t
+            if terms is not None:
+                terms["cldice"] = _t.detach()
         if self.tversky_weight != 0.0:
-            loss = loss + self.tversky_weight * tversky_loss_from_probs(
+            _t = tversky_loss_from_probs(
                 probs, targets, classes=self.tversky_classes,
                 alpha=self.tversky_alpha, beta=self.tversky_beta,
             )
+            loss = loss + self.tversky_weight * _t
+            if terms is not None:
+                terms["tversky"] = _t.detach()
+        # ---- MARGINALIZED aux terms, in 18-group space ----------------------
+        # One [B, G, *spatial] tensor (18/104 the size of `probs`) plus a group
+        # target volume; both freed before returning. The same clDice / Tversky
+        # implementations are reused, so `group_*_classes` are indices in
+        # GROUP space (2 = Cortex, 6 = CerebCortex, 3/4/11/12 = ventricles...).
+        if self._group_on():
+            g_probs = marginalize_probs(probs, self.group_lut,
+                                        self.group_n_classes)
+            g_targets = self.group_lut[targets.clamp_max(
+                self.group_lut.numel() - 1)]
+            if self.group_tversky_weight != 0.0:
+                _t = tversky_loss_from_probs(
+                    g_probs, g_targets, classes=self.group_tversky_classes,
+                    alpha=self.group_tversky_alpha,
+                    beta=self.group_tversky_beta,
+                )
+                loss = loss + self.group_tversky_weight * _t
+                if terms is not None:
+                    terms["group_tversky"] = _t.detach()
+            if self.group_cldice_weight != 0.0:
+                _t = cldice_loss_from_probs(
+                    g_probs, g_targets, self.group_cldice_iters,
+                    self.group_cldice_include_bg, self.group_cldice_downsample,
+                    classes=self.group_cldice_classes,
+                )
+                loss = loss + self.group_cldice_weight * _t
+                if terms is not None:
+                    terms["group_cldice"] = _t.detach()
+            del g_probs, g_targets
+        if terms is not None:
+            terms["total"] = loss.detach()
+            self._terms = terms
         return loss
 
 

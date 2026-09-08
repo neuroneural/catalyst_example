@@ -15,7 +15,7 @@ import torch
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 
-from dice import faster_dice, DiceLoss, CEDiceLoss
+from dice import faster_dice, DiceLoss, CEDiceLoss, GROUP_LUTS
 from surface_metrics import all_class_metrics, label_name
 from meshnet import enMesh_checkpoint, enMesh, enMesh_checkpoint_SE, enMesh_SE
 from meshnet_gn import enMesh_checkpoint as enMesh_checkpoint_gn, SpatialAEMeshNet
@@ -288,6 +288,18 @@ class CustomRunner(dl.Runner):
         tversky_alpha=0.7,
         tversky_beta=0.3,
         tversky_classes=None,
+        group_lut=None,
+        group_n_classes=None,
+        group_cldice_weight=0.0,
+        group_cldice_iters=5,
+        group_cldice_downsample=1,
+        group_cldice_include_bg=False,
+        group_cldice_classes=None,
+        group_tversky_weight=0.0,
+        group_tversky_alpha=0.6,
+        group_tversky_beta=0.4,
+        group_tversky_classes=None,
+        loss_log_terms=False,
         ce_class_weight_overrides=None,
         valid_cfg=None,
         maxshape=300,
@@ -378,6 +390,22 @@ class CustomRunner(dl.Runner):
         self.tversky_alpha = float(tversky_alpha)
         self.tversky_beta = float(tversky_beta)
         self.tversky_classes = list(tversky_classes) if tversky_classes else None
+        # Marginalized (group-space) aux terms. Defaults are inert: with
+        # group_*_weight == 0 the criterion is built exactly as before.
+        self.group_lut = list(group_lut) if group_lut else None
+        self.group_n_classes = group_n_classes
+        self.group_cldice_weight = float(group_cldice_weight)
+        self.group_cldice_iters = int(group_cldice_iters)
+        self.group_cldice_downsample = int(group_cldice_downsample)
+        self.group_cldice_include_bg = bool(group_cldice_include_bg)
+        self.group_cldice_classes = (list(group_cldice_classes)
+                                     if group_cldice_classes else None)
+        self.group_tversky_weight = float(group_tversky_weight)
+        self.group_tversky_alpha = float(group_tversky_alpha)
+        self.group_tversky_beta = float(group_tversky_beta)
+        self.group_tversky_classes = (list(group_tversky_classes)
+                                      if group_tversky_classes else None)
+        self.loss_log_terms = bool(loss_log_terms)
         self.ce_class_weight_overrides = dict(ce_class_weight_overrides or {})
         # Optional separate validation source + surface metrics (e.g. real MRN).
         # Empty dict => legacy behavior (validate on synth range(32), dice only).
@@ -1001,6 +1029,7 @@ class CustomRunner(dl.Runner):
         if th and th.get("enabled", False):
             from two_head import TwoHeadMeshNet
             init_from = th.get("init_from") or (self.model_path or "")
+            aux_sd = {}
             if init_from and os.path.isfile(init_from):
                 sd = _strip_compile_prefix(load_checkpoint(init_from))
                 # tolerate BOTH a single-head checkpoint (model.*) and a two-head
@@ -1010,6 +1039,7 @@ class CustomRunner(dl.Runner):
                 base_sd = {}
                 for k, v in sd.items():
                     if k.startswith("head_aux."):
+                        aux_sd[k.removeprefix("head_aux.")] = v
                         continue
                     base_sd[k[len("base."):] if k.startswith("base.") else k] = v
                 missing, unexpected = model.load_state_dict(base_sd, strict=False)
@@ -1020,6 +1050,12 @@ class CustomRunner(dl.Runner):
                 print(f"[two_head] WARNING: init_from not found ({init_from!r}); "
                       f"base starts from random init", file=sys.stderr, flush=True)
             model = TwoHeadMeshNet(model, aux_classes=int(th.get("aux_classes", 18)))
+            if aux_sd:
+                missing, unexpected = model.head_aux.load_state_dict(
+                    aux_sd, strict=False)
+                print(f"[two_head] aux resumed from {init_from} "
+                      f"({len(missing)} missing, {len(unexpected)} unexpected)",
+                      file=sys.stderr, flush=True)
             model.use_checkpoint = self.use_checkpoint
             print(f"[two_head] wrapped: deploy={model.n_classes} aux={model.aux_classes}",
                   file=sys.stderr, flush=True)
@@ -1063,6 +1099,18 @@ class CustomRunner(dl.Runner):
         tversky_alpha = float(getattr(self, "tversky_alpha", 0.7))
         tversky_beta = float(getattr(self, "tversky_beta", 0.3))
         tversky_classes = getattr(self, "tversky_classes", None)
+        group_lut = getattr(self, "group_lut", None)
+        group_n_classes = getattr(self, "group_n_classes", None)
+        group_cldice_weight = float(getattr(self, "group_cldice_weight", 0.0))
+        group_cldice_iters = int(getattr(self, "group_cldice_iters", 5))
+        group_cldice_downsample = int(getattr(self, "group_cldice_downsample", 1))
+        group_cldice_include_bg = bool(getattr(self, "group_cldice_include_bg", False))
+        group_cldice_classes = getattr(self, "group_cldice_classes", None)
+        group_tversky_weight = float(getattr(self, "group_tversky_weight", 0.0))
+        group_tversky_alpha = float(getattr(self, "group_tversky_alpha", 0.6))
+        group_tversky_beta = float(getattr(self, "group_tversky_beta", 0.4))
+        group_tversky_classes = getattr(self, "group_tversky_classes", None)
+        loss_log_terms = bool(getattr(self, "loss_log_terms", False))
 
         # Fused path: one log_softmax shared by CE and Dice (saves a full
         # softmax volume at 104 classes / 256^3). Opt-in via cfg.model.loss_fused.
@@ -1083,6 +1131,28 @@ class CustomRunner(dl.Runner):
                       f"alpha={tversky_alpha} beta={tversky_beta} "
                       f"classes={tversky_classes or 'all-fg'}",
                       file=sys.stderr, flush=True)
+            if group_tversky_weight > 0 or group_cldice_weight > 0:
+                n_g = (int(group_n_classes) if group_n_classes
+                       else (max(group_lut) + 1 if group_lut else 0))
+                print(f"[loss] MARGINALIZED aux terms ON: {self.n_classes} classes "
+                      f"-> {n_g} groups (lut len {len(group_lut or [])})",
+                      file=sys.stderr, flush=True)
+                if group_tversky_weight > 0:
+                    print(f"[loss]   group Tversky: weight={group_tversky_weight} "
+                          f"alpha={group_tversky_alpha} beta={group_tversky_beta} "
+                          f"GROUP classes={group_tversky_classes or 'all-fg'}",
+                          file=sys.stderr, flush=True)
+                if group_cldice_weight > 0:
+                    print(f"[loss]   group clDice: weight={group_cldice_weight} "
+                          f"iters={group_cldice_iters} "
+                          f"downsample={group_cldice_downsample} "
+                          f"GROUP classes={group_cldice_classes or 'all-fg'}",
+                          file=sys.stderr, flush=True)
+            if loss_log_terms:
+                print("[loss] per-term logging ON (wandb only). Set "
+                      "FAST_COMPILE_LOSS=0: writing terms to self inside "
+                      "forward breaks the compiled graph.",
+                      file=sys.stderr, flush=True)
             return CEDiceLoss(
                 loss_weight=tuple(self.loss_weight),
                 class_weight=class_weight,
@@ -1101,11 +1171,24 @@ class CustomRunner(dl.Runner):
                 tversky_alpha=tversky_alpha,
                 tversky_beta=tversky_beta,
                 tversky_classes=tversky_classes,
+                group_lut=group_lut,
+                group_n_classes=group_n_classes,
+                group_cldice_weight=group_cldice_weight,
+                group_cldice_iters=group_cldice_iters,
+                group_cldice_downsample=group_cldice_downsample,
+                group_cldice_include_bg=group_cldice_include_bg,
+                group_cldice_classes=group_cldice_classes,
+                group_tversky_weight=group_tversky_weight,
+                group_tversky_alpha=group_tversky_alpha,
+                group_tversky_beta=group_tversky_beta,
+                group_tversky_classes=group_tversky_classes,
+                log_terms=loss_log_terms,
             ).to(self.engine.device)
 
-        if boundary_weight > 0 or cldice_weight > 0 or tversky_weight > 0:
+        if (boundary_weight > 0 or cldice_weight > 0 or tversky_weight > 0
+                or group_cldice_weight > 0 or group_tversky_weight > 0):
             raise ValueError(
-                "boundary_weight/cldice_weight/tversky_weight>0 require "
+                "boundary_weight/cldice_weight/tversky_weight/group_* > 0 require "
                 "model.loss_fused=True (all live in the fused CEDiceLoss path)."
             )
 
@@ -1525,6 +1608,48 @@ class CustomRunner(dl.Runner):
         th = getattr(self, "two_head_cfg", None)
         return bool(th and th.get("enabled", False))
 
+    def _supervised_missing_on(self):
+        th = getattr(self, "two_head_cfg", None)
+        return bool(th and th.get("enabled", False)
+                    and th.get("supervision") == "missing_tissue")
+
+    def _aux_weight_now(self):
+        """Warm up the supervised missing-tissue head before it reshapes trunk."""
+        th = self.two_head_cfg
+        w = float(th.get("aux_loss_weight", 0.2))
+        self._aux_step = getattr(self, "_aux_step", 0) + 1
+        warm = int(th.get("aux_warmup_steps", 2000))
+        if warm > 0:
+            w *= min(1.0, self._aux_step / warm)
+        return w
+
+    def _apply_auxiliary_head_loss(self, loss, y_hat, y_aux, sample, aux_target):
+        """Add either supervised missing-tissue GDL or legacy teacher KD."""
+        if y_aux is None:
+            return loss
+        if self._supervised_missing_on():
+            if y_aux.shape[1] != 2:
+                raise ValueError("missing_tissue supervision requires aux_classes=2")
+            if aux_target is None:
+                raise RuntimeError("missing_tissue aux target was not constructed")
+            aux_loss = DiceLoss(generalized=bool(
+                self.two_head_cfg.get("aux_generalized_dice", True)))(
+                    y_aux, aux_target)
+            self._last_aux = aux_loss.detach()
+            return loss + self._aux_weight_now() * aux_loss
+
+        _d = self._get_distiller()
+        if _d is not None:
+            _kd18 = _d.kd18_loss(y_aux, sample)
+            self._last_kd = _kd18.detach()
+            loss = loss + self._kd_weight_now() * _kd18
+            _lm = self._marg_weight_now()
+            if _lm > 0.0:
+                _mc = _d.marginal_consistency_loss(y_hat, y_aux)
+                self._last_marg = _mc.detach()
+                loss = loss + _lm * _mc
+        return loss
+
     def _kd_weight_now(self):
         """Effective KD weight with a linear warmup. The raw 18-class KD is a
         T^2-scaled KL summed over 18 classes -- at init (random aux head) it is
@@ -1565,6 +1690,12 @@ class CustomRunner(dl.Runner):
             torch.cuda.synchronize()
 
         sample, label = batch
+        raw_label = label
+        aux_target = None
+        if self._supervised_missing_on():
+            missing_id = int(self.two_head_cfg.get(
+                "missing_target_id", self.n_classes))
+            aux_target = (raw_label == missing_id).long()
         # Clamp any label index >= n_classes to 0 (background). CE gather /
         # class_weight[targets] / dice would otherwise index the class dim out of
         # bounds -> CUDA device-side assert. Two cases this covers: (1) real
@@ -1572,7 +1703,8 @@ class CustomRunner(dl.Runner):
         # training an N-class model on data with >N classes -- e.g. an 18-class
         # model on the 0-20 synth: CSF/skull fold back into background, which IS
         # the 18-class scheme. No-op when labels already fit [0, n_classes-1].
-        label = torch.where(label < self.n_classes, label, torch.zeros_like(label))
+        label = torch.where(raw_label < self.n_classes, raw_label,
+                            torch.zeros_like(raw_label))
         refiner_delta_penalty = torch.zeros((), device=sample.device)
         refiner_base_loss = torch.zeros((), device=sample.device)
         scheduled_blend = 0.0 if getattr(self, "_refiner_frozen", False) else self.refiner_blend
@@ -1624,16 +1756,8 @@ class CustomRunner(dl.Runner):
 
                         loss = self.criterion(y_hat, label)
                         if y_aux is not None:
-                            _d = self._get_distiller()
-                            if _d is not None:
-                                _kd18 = _d.kd18_loss(y_aux, sample)
-                                self._last_kd = _kd18.detach()
-                                loss = loss + self._kd_weight_now() * _kd18
-                                _lm = self._marg_weight_now()
-                                if _lm > 0.0:
-                                    _mc = _d.marginal_consistency_loss(y_hat, y_aux)
-                                    self._last_marg = _mc.detach()
-                                    loss = loss + _lm * _mc
+                            loss = self._apply_auxiliary_head_loss(
+                                loss, y_hat, y_aux, sample, aux_target)
                         else:
                             _kd, _alpha = self._maybe_kd_loss(y_hat, sample)
                             if _kd is not None:
@@ -1667,16 +1791,8 @@ class CustomRunner(dl.Runner):
                         y_hat, y_aux = self.model.forward(sample), None
                     loss = self.criterion(y_hat, label)
                     if y_aux is not None:
-                        _d = self._get_distiller()
-                        if _d is not None:
-                            _kd18 = _d.kd18_loss(y_aux, sample)
-                            self._last_kd = _kd18.detach()
-                            loss = loss + self._kd_weight_now() * _kd18
-                            _lm = self._marg_weight_now()
-                            if _lm > 0.0:
-                                _mc = _d.marginal_consistency_loss(y_hat, y_aux)
-                                self._last_marg = _mc.detach()
-                                loss = loss + _lm * _mc
+                        loss = self._apply_auxiliary_head_loss(
+                            loss, y_hat, y_aux, sample, aux_target)
                     else:
                         _kd, _alpha = self._maybe_kd_loss(y_hat, sample)
                         if _kd is not None:
@@ -1900,6 +2016,32 @@ class CustomRunner(dl.Runner):
         except Exception:
             pass
 
+        # Per-term loss breakdown -> wandb ONLY (never tqdm), same naming/step
+        # convention as approx_dice. CEDiceLoss stashes each term of its LAST
+        # forward in `_terms` when model.loss_log_terms is on; nothing here
+        # feeds the training math. This is what makes an aux-loss arm readable
+        # as it unfolds: if lossterm_group_tversky falls while lossterm_ce
+        # climbs, the aux term is winning against the data term and the weight
+        # is too high. Values are detached tensors, so float() is the only sync.
+        _terms = getattr(getattr(self, "criterion", None), "_terms", None)
+        if _terms:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    loader_key = getattr(self, "loader_key", "train")
+                    step = getattr(self, "sample_step",
+                                   getattr(self, "global_sample_step", None))
+                    if step is None:
+                        step = wandb.run.step
+                    wandb.log(
+                        {f"lossterm_{k}_batch/{loader_key}": float(v)
+                         for k, v in _terms.items()},
+                        step=step,
+                        commit=False,
+                    )
+            except Exception:
+                pass
+
         # two-head KD / marginal-consistency -> wandb only (never in tqdm), same
         # naming/step convention as approx_dice so they land as kd_batch/<loader>
         # and marg_batch/<loader>.
@@ -1917,6 +2059,9 @@ class CustomRunner(dl.Runner):
                         payload[f"kd_batch/{loader_key}"] = float(self._last_kd)
                     if getattr(self, "_last_marg", None) is not None:
                         payload[f"marg_batch/{loader_key}"] = float(self._last_marg)
+                    if getattr(self, "_last_aux", None) is not None:
+                        payload[f"missing_gdl_batch/{loader_key}"] = float(
+                            self._last_aux)
                     if getattr(self, "_last_jdx", None) is not None:
                         payload[f"jdx_batch/{loader_key}"] = float(self._last_jdx)
                     if payload:
@@ -2106,6 +2251,41 @@ def main(cfg: DictConfig):
     tversky_beta = float(cfg.model.get("tversky_beta", 0.3))
     _tvc = cfg.model.get("tversky_classes", None)
     tversky_classes = list(OmegaConf.to_container(_tvc, resolve=True)) if _tvc is not None else None
+    # --- marginalized (group-space) aux terms -------------------------------
+    # model.group_lut takes either a NAME from dice.GROUP_LUTS ("lut104_to_18")
+    # or an explicit list of length n_classes. Absent => terms stay off and the
+    # criterion is built exactly as before.
+    _glut = cfg.model.get("group_lut", None)
+    if _glut is None:
+        group_lut = None
+    elif isinstance(_glut, str):
+        if _glut not in GROUP_LUTS:
+            raise SystemExit(f"model.group_lut '{_glut}' unknown; "
+                             f"known: {sorted(GROUP_LUTS)}")
+        group_lut = list(GROUP_LUTS[_glut])
+    else:
+        group_lut = list(OmegaConf.to_container(_glut, resolve=True))
+    if group_lut is not None and len(group_lut) != int(cfg.model.n_classes):
+        raise SystemExit(
+            f"model.group_lut has {len(group_lut)} entries but "
+            f"model.n_classes is {int(cfg.model.n_classes)}"
+        )
+    group_n_classes = cfg.model.get("group_n_classes", None)
+    group_n_classes = int(group_n_classes) if group_n_classes is not None else None
+    group_cldice_weight = float(cfg.model.get("group_cldice_weight", 0.0))
+    group_cldice_iters = int(cfg.model.get("group_cldice_iters", 5))
+    group_cldice_downsample = int(cfg.model.get("group_cldice_downsample", 1))
+    group_cldice_include_bg = bool(cfg.model.get("group_cldice_include_bg", False))
+    _gclc = cfg.model.get("group_cldice_classes", None)
+    group_cldice_classes = (list(OmegaConf.to_container(_gclc, resolve=True))
+                            if _gclc is not None else None)
+    group_tversky_weight = float(cfg.model.get("group_tversky_weight", 0.0))
+    group_tversky_alpha = float(cfg.model.get("group_tversky_alpha", 0.6))
+    group_tversky_beta = float(cfg.model.get("group_tversky_beta", 0.4))
+    _gtvc = cfg.model.get("group_tversky_classes", None)
+    group_tversky_classes = (list(OmegaConf.to_container(_gtvc, resolve=True))
+                             if _gtvc is not None else None)
+    loss_log_terms = bool(cfg.model.get("loss_log_terms", False))
     _cw = cfg.model.get("ce_class_weight_overrides", None)
     ce_class_weight_overrides = OmegaConf.to_container(_cw, resolve=True) if _cw is not None else {}
     _vc = cfg.get("validation", None)
@@ -2257,6 +2437,18 @@ def main(cfg: DictConfig):
             tversky_alpha=tversky_alpha,
             tversky_beta=tversky_beta,
             tversky_classes=tversky_classes,
+            group_lut=group_lut,
+            group_n_classes=group_n_classes,
+            group_cldice_weight=group_cldice_weight,
+            group_cldice_iters=group_cldice_iters,
+            group_cldice_downsample=group_cldice_downsample,
+            group_cldice_include_bg=group_cldice_include_bg,
+            group_cldice_classes=group_cldice_classes,
+            group_tversky_weight=group_tversky_weight,
+            group_tversky_alpha=group_tversky_alpha,
+            group_tversky_beta=group_tversky_beta,
+            group_tversky_classes=group_tversky_classes,
+            loss_log_terms=loss_log_terms,
             ce_class_weight_overrides=ce_class_weight_overrides,
             valid_cfg=valid_cfg,
             meshnetme=cfg.model.use_me,
@@ -2309,6 +2501,22 @@ def main(cfg: DictConfig):
             OmegaConf.to_container(_two_head_cfg, resolve=True)
             if _two_head_cfg is not None else None
         )
+        # Periodic real-data (e.g. MindfulTensors/MRN) boundary-metric eval,
+        # attached the same way as distill_cfg/two_head_cfg above so it survives
+        # DDP mp.spawn (instance attrs set before runner.run() are pickled into
+        # each rank; class-level state set elsewhere in main() is not). No-op
+        # unless real_eval.enabled=True AND the runner's get_callbacks() wires it
+        # up -- currently only FastRunner (curriculum_training_fast.py) does.
+        _real_eval_cfg = cfg.get("real_eval", None)
+        runner.real_eval_cfg = (
+            OmegaConf.to_container(_real_eval_cfg, resolve=True)
+            if _real_eval_cfg is not None else {}
+        )
+        try:
+            from hydra.core.hydra_config import HydraConfig
+            runner.config_name = HydraConfig.get().job.config_name
+        except Exception:
+            runner.config_name = None
         runner.run()
 
         shutil.copy(
