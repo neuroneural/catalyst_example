@@ -58,6 +58,7 @@ os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
 import hydra
 import torch
+from catalyst import dl
 from omegaconf import DictConfig
 
 import curriculum_training as base
@@ -89,6 +90,25 @@ def _strip_orig_mod_prefix(state_dict, prefix, local_metadata, strict,
 def _envflag(name, default):
     v = os.environ.get(name)
     return default if v is None else v not in ("0", "", "false", "False", "no", "No")
+
+
+# Periodic real-data (MindfulTensors/MRN) boundary eval, wired in
+# FastRunner.get_callbacks() below and off unless real_eval.enabled=True.
+#
+# The implementation lives in real_eval_ddp.py. Read its module docstring before
+# touching it: the short version is that inference is DDP-SHARDED across every
+# rank using the live in-memory model (no checkpoint reload, no second CUDA
+# context, no GPU contention), and the expensive CPU half -- the surface
+# distance transforms -- is handed to a detached, CUDA-free, nice'd
+# multiprocessing pool (real_eval_reduce.py) that runs while the next epoch
+# trains. The callback adds ZERO collectives to the training loop, so it cannot
+# desync or hang DDP.
+#
+# This replaced an earlier version that launched eval_real_metrics.py as a
+# subprocess on rank 0: that reloaded the checkpoint onto GPU 0 and made the
+# rank every allreduce waits for the slowest one. eval_real_metrics.py itself is
+# untouched and remains the standalone A/B tool.
+from real_eval_ddp import RealEvalCallback  # noqa: F401
 
 
 class FastRunner(base.CustomRunner):
@@ -256,6 +276,10 @@ class FastRunner(base.CustomRunner):
                 print("[fast/resume] NO resume_model (paths.loadcheckpoint=False or "
                       "empty paths.model) -> starting from scratch",
                       file=sys.stderr, flush=True)
+        # Periodic real-data eval (Dice/NSD/HD95/ASSD on MindfulTensors/MRN),
+        # off unless real_eval.enabled=True in the yaml. See RealEvalCallback.
+        if (getattr(self, "real_eval_cfg", None) or {}).get("enabled", False):
+            cbs["real_eval"] = RealEvalCallback()
         return cbs
 
     def _weight_fingerprint(self):
