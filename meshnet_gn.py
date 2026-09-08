@@ -1,11 +1,12 @@
 from collections import OrderedDict
 import gc
 import time
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.functional import jvp
-from torch.utils.checkpoint import checkpoint_sequential
+from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 import json
 import copy
 
@@ -385,12 +386,83 @@ class MixedMeshNet(nn.Module):
         return x
 
 
+
+def _ckpt_seq_traceable(functions, segments, x, preserve_rng_state=False):
+    """Dynamo-traceable stand-in for torch.utils.checkpoint.checkpoint_sequential.
+
+    WHY THIS EXISTS. `checkpoint_sequential` lives in torch/utils/checkpoint.py,
+    which is in Dynamo's MOD_SKIPLIST: torch.compile refuses to trace INTO it and
+    graph-breaks instead. Because essentially the whole MeshNet forward is that
+    one call, the break means `unique_graphs: 0` -- torch.compile produces NO
+    graph at all and the entire model trains eager, silently, with
+    `[fast] in-place compile` still printing happily. Measured on A100 at cube 64
+    (compile_probe.py): 24ch/104-class with checkpoint_segments=2 got 1.08x from
+    compile (i.e. nothing, and 2 graph breaks), while the same model with
+    use_checkpoint=False got 1.85x and 1 graph, 0 breaks.
+
+    `torch.utils.checkpoint.checkpoint` with use_reentrant=False is different:
+    Dynamo has first-class support for it (it becomes the
+    tag_activation_checkpoint higher-order op inside the graph), so inductor
+    still fuses conv->GroupNorm->GELU across the checkpointed region.
+
+    Semantics are a faithful copy of upstream checkpoint_sequential, including
+    the easily-missed detail that the LAST segment runs UNCHECKPOINTED -- so peak
+    memory is unchanged. No math changes; this only affects how activations are
+    recomputed.
+
+    Set MESHNET_STOCK_CKPT_SEQ=1 to fall back to stock checkpoint_sequential.
+    """
+    if isinstance(functions, torch.nn.Sequential):
+        functions = list(functions.children())
+    else:
+        functions = list(functions)
+    n = len(functions)
+    if n == 0:
+        return x
+    segments = max(1, min(int(segments), n))
+
+    def run(start, end):
+        def forward(inp):
+            for j in range(start, end + 1):
+                inp = functions[j](inp)
+            return inp
+        return forward
+
+    segment_size = n // segments
+    end = -1
+    for start in range(0, segment_size * (segments - 1), segment_size):
+        end = start + segment_size - 1
+        x = checkpoint(run(start, end), x, use_reentrant=False,
+                       preserve_rng_state=preserve_rng_state)
+    return run(end + 1, n - 1)(x)
+
+
+def _ckpt_seq(functions, segments, x, preserve_rng_state=False):
+    if os.environ.get("MESHNET_STOCK_CKPT_SEQ", "") not in ("", "0"):
+        return checkpoint_sequential(functions, segments, x,
+                                     preserve_rng_state=preserve_rng_state,
+                                     use_reentrant=False)
+    return _ckpt_seq_traceable(functions, segments, x,
+                               preserve_rng_state=preserve_rng_state)
+
+
 class CheckpointMixin:
     def train_forward(self, x):
         if not getattr(self, "use_checkpoint", True):
             return self.model(x)
         y = x
-        y.requires_grad_()
+        # NOTE: there used to be a `y.requires_grad_()` here. It was the standard
+        # workaround for REENTRANT checkpointing: with use_reentrant=True, if the
+        # input to a checkpointed region does not require grad, the recomputed
+        # subgraph has no grad path and the parameters inside silently get NO
+        # gradients (verified: 12 of 24 param grads missing in a 6-layer toy).
+        # Every call here is use_reentrant=False, which handles a non-grad input
+        # correctly via saved-tensor hooks -- param grads are bit-identical with
+        # and without it (verified). Meanwhile Dynamo cannot trace
+        # Tensor.requires_grad_() at all (gb0125), so it graph-broke the forward
+        # on the FIRST statement of the compiled region. Dropping it also stops
+        # autograd allocating a gradient for the 256^3 input, which nothing uses.
+        # If you ever reintroduce use_reentrant=True, put it back.
         n_layers = len(self.model)
         # checkpoint_segments controls the recompute granularity:
         #   None / <=0  -> one segment per layer (max memory saving, max recompute
@@ -417,15 +489,11 @@ class CheckpointMixin:
             y = head(y)
             if len(tail) > 0:
                 seg = min(int(segments), len(tail))
-                y = checkpoint_sequential(
-                    tail, seg, y, preserve_rng_state=False, use_reentrant=False
-                )
+                y = _ckpt_seq(tail, seg, y, preserve_rng_state=False)
             return y
 
         segments = min(int(segments), n_layers)
-        y = checkpoint_sequential(
-            self.model, segments, y, preserve_rng_state=False, use_reentrant=False
-        )
+        y = _ckpt_seq(self.model, segments, y, preserve_rng_state=False)
         return y
 
     def eval_forward(self, x):
